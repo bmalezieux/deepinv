@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
@@ -16,6 +16,7 @@ from deepinv.distributed.distrib_framework import (
     DistributedStackedLinearPhysics,
     DistributedProcessing,
     DistributedDataFidelity,
+    DistributedReplicatedParameters,
 )
 
 from deepinv.distributed.strategies import DistributedSignalStrategy
@@ -211,6 +212,55 @@ def _distribute_data_fidelity(
     )
 
 
+def _distribute_replicated_parameters(
+    params: torch.nn.Parameter | Sequence[torch.nn.Parameter],
+    ctx: DistributedContext,
+    *,
+    average: bool = True,
+):
+    r"""
+    Attach distributed gradient synchronization to replicated parameters.
+    """
+    if isinstance(params, torch.nn.Parameter):
+        if params.device != ctx.device:
+            params = torch.nn.Parameter(
+                params.data.to(ctx.device), requires_grad=params.requires_grad
+            )
+        sync = DistributedReplicatedParameters(ctx, [params], average=average)
+        setattr(params, "_deepinv_dist_sync", sync)
+        return params
+
+    params_list = list(params)
+    for i, p in enumerate(params_list):
+        if not isinstance(p, torch.nn.Parameter):
+            raise TypeError(f"Expected torch.nn.Parameter, got {type(p)} at index {i}.")
+        if p.device != ctx.device:
+            params_list[i] = torch.nn.Parameter(
+                p.data.to(ctx.device), requires_grad=p.requires_grad
+            )
+
+    sync = DistributedReplicatedParameters(ctx, params_list, average=average)
+    for p in params_list:
+        setattr(p, "_deepinv_dist_sync", sync)
+    return params_list
+
+
+def _distribute_replicated_module(
+    module: torch.nn.Module,
+    ctx: DistributedContext,
+    *,
+    average: bool = True,
+):
+    r"""
+    Attach distributed gradient synchronization to a generic torch module.
+    """
+    module = module.to(ctx.device)
+    params = [p for p in module.parameters() if p.requires_grad]
+    sync = DistributedReplicatedParameters(ctx, params, average=average)
+    setattr(module, "_deepinv_dist_sync", sync)
+    return module
+
+
 def distribute(
     object: (
         StackedPhysics
@@ -222,6 +272,9 @@ def distribute(
         | list[DataFidelity]
         | StackedPhysicsDataFidelity
         | Callable[[int, torch.device, dict | None], DataFidelity]
+        | torch.nn.Parameter
+        | Sequence[torch.nn.Parameter]
+        | torch.nn.Module
     ),
     ctx: DistributedContext,
     *,
@@ -240,6 +293,9 @@ def distribute(
     | DistributedStackedLinearPhysics
     | DistributedProcessing
     | DistributedDataFidelity
+    | torch.nn.Parameter
+    | list[torch.nn.Parameter]
+    | torch.nn.Module
 ):
     r"""
     Distribute a DeepInverse object across multiple devices.
@@ -252,10 +308,12 @@ def distribute(
         - Data fidelity terms: a list of :class:`deepinv.optim.DataFidelity` or :class:`deepinv.optim.StackedPhysicsDataFidelity`.
         - Priors/Denoisers: :class:`deepinv.models.Denoiser` or :class:`deepinv.optim.Prior` objects.
 
-    :param StackedPhysics | list[Physics] | Callable | Denoiser | DataFidelity | StackedPhysicsDataFidelity | list[DataFidelity] object: DeepInverse object to distribute. The supported types are listed above.
+    :param StackedPhysics | list[Physics] | Callable | Denoiser | DataFidelity | StackedPhysicsDataFidelity | list[DataFidelity] | torch.nn.Module | torch.nn.Parameter | Sequence[torch.nn.Parameter] object:
+        DeepInverse object to distribute. In addition to DeepInverse objects, generic replicated
+        modules and parameters are auto-detected and equipped with distributed gradient sync.
     :param DistributedContext ctx: distributed context manager.
     :param int | None num_operators: number of physics operators when using a factory for physics, otherwise inferred. Default is `None`.
-    :param str | None type_object: type of object to distribute. Options are `'physics'`, `'linear_physics'`, `'data_fidelity'`, `'denoiser'`, or `'auto'` for automatic detection. Default is `'auto'`.
+    :param str | None type_object: type of object to distribute. Options are `'physics'`, `'linear_physics'`, `'data_fidelity'`, `'denoiser'`, `'module'`, `'parameters'`, or `'auto'` for automatic detection. Default is `'auto'`.
     :param torch.dtype | None dtype: data type for distributed object. Default is `torch.float32`.
     :param str gather_strategy: strategy for gathering distributed results.
 
@@ -341,6 +399,16 @@ def distribute(
             type_object = "data_fidelity"
         elif isinstance(object, Denoiser):
             type_object = "denoiser"
+        elif isinstance(object, torch.nn.Parameter):
+            type_object = "parameters"
+        elif isinstance(object, torch.nn.Module):
+            type_object = "module"
+        elif (
+            isinstance(object, (list, tuple))
+            and len(object) > 0
+            and isinstance(object[0], torch.nn.Parameter)
+        ):
+            type_object = "parameters"
         elif callable(object):
             raise ValueError(
                 "For callable objects, you must specify type_object parameter"
@@ -378,5 +446,9 @@ def distribute(
             num_operators=num_operators,
             **kwargs,
         )
+    elif type_object == "parameters":
+        return _distribute_replicated_parameters(object, ctx, **kwargs)
+    elif type_object == "module":
+        return _distribute_replicated_module(object, ctx, **kwargs)
     else:
         raise ValueError(f"Unsupported type_object: {type_object}")
