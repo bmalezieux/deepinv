@@ -42,6 +42,9 @@ from deepinv.distributed.framework import (
     DistributedDataFidelity,
     DistributedReplicatedParameters,
 )
+from deepinv.distributed.framework.distributed_utils import (
+    DistributedGradientSync,
+)
 from deepinv.distributed.distribute import (
     distribute,
     _distribute_base_optim,
@@ -1330,9 +1333,274 @@ def test_distributed_context_invalid_inner_world_size():
     """The inner process count must be positive and divide the global world."""
     with pytest.raises(ValueError, match="positive integer"):
         DistributedContext(inner_world_size=0)
+    with pytest.raises(ValueError, match="gradient_reduction"):
+        DistributedContext(gradient_reduction="median")
     with pytest.raises(ValueError, match="must divide"):
         with DistributedContext(device_mode="cpu", inner_world_size=2):
             pass
+
+
+def _test_ddp_worker(rank, world_size, args):
+    reduction = args["reduction"]
+    with DistributedContext(
+        device_mode="cpu",
+        inner_world_size=2,
+        gradient_reduction=reduction,
+    ) as ctx:
+        denoiser = TrainableDenoiser().to(ctx.device)
+        model = distribute(denoiser, ctx, tiling_dims=(-2, -1), patch_size=8, overlap=0)
+        model = ctx.distributed_data_parallel(model)
+
+        # One image per replica, shared by the two ranks of an inner group.
+        # It must vary spatially, otherwise all tiles are identical.
+        x = torch.arange(256.0, device=ctx.device).reshape(1, 1, 16, 16) / 255.0
+        model(x * (ctx.dp_rank + 1)).square().sum().backward()
+
+        # Construct the exact centralized tiled reference for both samples.
+        reference = TrainableDenoiser().to(ctx.device)
+        strategy = create_strategy(
+            x.shape, tiling_dims=(-2, -1), patch_size=8, overlap=0
+        )
+        reference_loss = 0.0
+        indices = list(range(strategy.get_num_patches()))
+        for scale in (1.0, 2.0):
+            pairs = strategy.get_local_patches(x * scale, indices)
+            processed = [reference(patch) for _, patch in pairs]
+            output = torch.zeros_like(x)
+            strategy.reduce_patches(output, list(zip(indices, processed, strict=True)))
+            reference_loss = reference_loss + output.square().sum() / 2.0
+        reference_loss.backward()
+
+        return {
+            "weight": denoiser.conv.weight.grad.flatten().tolist(),
+            "bias": denoiser.conv.bias.grad.flatten().tolist(),
+            "reference_weight": reference.conv.weight.grad.flatten().tolist(),
+            "reference_bias": reference.conv.bias.grad.flatten().tolist(),
+        }
+
+
+@pytest.mark.parametrize(
+    ("reduction", "reference_factor"), [("mean", 1.0), ("sum", 4.0)]
+)
+def test_ddp_desynchronizes_inner_ranks(reduction, reference_factor):
+    """DDP and inner parallelism must produce one correct global gradient."""
+    config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
+    results = run_distributed_test(
+        _test_ddp_worker,
+        config,
+        {"reduction": reduction},
+        timeout_per_rank=30.0,
+    )
+
+    # Checking every rank catches failures in either topology dimension, while
+    # the centralized reference prevents an equally-wrong gradient from passing.
+    for result in results:
+        expected_weight = [
+            value * reference_factor for value in result["reference_weight"]
+        ]
+        expected_bias = [value * reference_factor for value in result["reference_bias"]]
+        assert result["weight"] == pytest.approx(expected_weight)
+        assert result["bias"] == pytest.approx(expected_bias)
+        assert result["weight"] == pytest.approx(results[0]["weight"])
+        assert result["bias"] == pytest.approx(results[0]["bias"])
+
+
+def _test_inner_only_gradient_worker(rank, world_size, args):
+    """Check that inner-only execution keeps DeepInv's callback reducer."""
+    with DistributedContext(
+        device_mode="cpu",
+        inner_world_size=world_size,
+        gradient_reduction=args["reduction"],
+    ) as ctx:
+        denoiser = TrainableDenoiser().to(ctx.device)
+        distributed = distribute(
+            denoiser, ctx, tiling_dims=(-2, -1), patch_size=8, overlap=0
+        )
+        model = ctx.distributed_data_parallel(distributed)
+        assert model is distributed
+        assert not isinstance(model, torch.nn.parallel.DistributedDataParallel)
+
+        x = torch.arange(256.0, device=ctx.device).reshape(1, 1, 16, 16) / 255.0
+        model(x).square().sum().backward()
+
+        reference = TrainableDenoiser().to(ctx.device)
+        strategy = create_strategy(
+            x.shape, tiling_dims=(-2, -1), patch_size=8, overlap=0
+        )
+        indices = list(range(strategy.get_num_patches()))
+        pairs = strategy.get_local_patches(x, indices)
+        processed = [reference(patch) for _, patch in pairs]
+        output = torch.zeros_like(x)
+        strategy.reduce_patches(output, list(zip(indices, processed, strict=True)))
+        output.square().sum().backward()
+        return {
+            "gradient": denoiser.conv.weight.grad.flatten().tolist(),
+            "reference": reference.conv.weight.grad.flatten().tolist(),
+        }
+
+
+@pytest.mark.parametrize(
+    ("reduction", "reference_factor"), [("mean", 1.0), ("sum", 2.0)]
+)
+def test_inner_only_gradient_sync_without_ddp(reduction, reference_factor):
+    """A single data replica must continue using DeepInv synchronization."""
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    results = run_distributed_test(
+        _test_inner_only_gradient_worker,
+        config,
+        {"reduction": reduction},
+        timeout_per_rank=20.0,
+    )
+    for result in results:
+        expected = [value * reference_factor for value in result["reference"]]
+        assert result["gradient"] == pytest.approx(expected)
+        assert result["gradient"] == pytest.approx(results[0]["gradient"])
+
+
+def _test_pure_ddp_gradient_worker(rank, world_size, args):
+    """Check the ordinary DDP path when every inner group is a singleton."""
+    with DistributedContext(device_mode="cpu", inner_world_size=1) as ctx:
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        DistributedReplicatedParameters(ctx, model.parameters())
+        model = ctx.distributed_data_parallel(model)
+        model(torch.tensor([[float(rank + 1)]])).sum().backward()
+        return next(model.parameters()).grad.item()
+
+
+def test_pure_ddp_gradient_sync():
+    """DDP must remain the sole owner when inner groups have one rank."""
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    gradients = run_distributed_test(
+        _test_pure_ddp_gradient_worker, config, timeout_per_rank=20.0
+    )
+    assert gradients == pytest.approx([1.5, 1.5])
+
+
+class _MultiLayerDenoiser(Denoiser):
+    """Small multi-parameter denoiser used to exercise several DDP buckets."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 2, 3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(2, 2, 3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(2, 1, 3, padding=1),
+        )
+        with torch.no_grad():
+            for parameter in self.parameters():
+                parameter.fill_(0.03)
+
+    def forward(self, x, sigma=None, **kwargs):
+        return self.layers(x)
+
+
+class _RepeatedProcessor(torch.nn.Module):
+    """Call one distributed processor repeatedly as in an unrolled iteration."""
+
+    def __init__(self, processor):
+        super().__init__()
+        self.processor = processor
+
+    def forward(self, x):
+        return self.processor(self.processor(x))
+
+
+def _test_ddp_repeated_processor_worker(rank, world_size, args):
+    with DistributedContext(device_mode="cpu", inner_world_size=2) as ctx:
+        denoiser = _MultiLayerDenoiser().to(ctx.device)
+        processor = distribute(
+            denoiser, ctx, tiling_dims=(-2, -1), patch_size=8, overlap=0
+        )
+        model = _RepeatedProcessor(processor)
+        model = ctx.distributed_data_parallel(model, bucket_cap_mb=0.0001)
+        x = torch.linspace(0.0, 1.0, 256, device=ctx.device).reshape(1, 1, 16, 16)
+
+        # The second iteration lets DDP rebuild its initial bucket while the
+        # repeated processor calls exercise graph-task callback deduplication.
+        for step in range(2):
+            model.zero_grad(set_to_none=True)
+            scale = float((ctx.dp_rank + 1) * (step + 1))
+            model(x * scale).square().mean().backward()
+
+        return torch.cat(
+            [parameter.grad.flatten() for parameter in denoiser.parameters()]
+        ).tolist()
+
+
+def test_ddp_repeated_processor_and_small_buckets():
+    """Repeated parameter use and small buckets must synchronize every rank."""
+    config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
+    gradients = run_distributed_test(
+        _test_ddp_repeated_processor_worker, config, timeout_per_rank=30.0
+    )
+    assert any(abs(value) > 0 for value in gradients[0])
+    for gradient in gradients[1:]:
+        assert gradient == pytest.approx(gradients[0])
+
+
+def _test_ddp_rejects_higher_order_worker(rank, world_size, args):
+    """DDP bucket collectives must not silently claim higher-order support."""
+    with DistributedContext(device_mode="cpu", inner_world_size=2) as ctx:
+        denoiser = TrainableDenoiser().to(ctx.device)
+        model = distribute(denoiser, ctx, tiling_dims=(-2, -1), patch_size=8, overlap=0)
+        model = ctx.distributed_data_parallel(model)
+        x = torch.ones(1, 1, 16, 16, device=ctx.device, requires_grad=True)
+        with pytest.raises(RuntimeError, match="Higher-order gradients"):
+            model(x).square().sum().backward(create_graph=True)
+        return "success"
+
+
+def test_ddp_rejects_higher_order_gradients():
+    """DDP must fail clearly instead of returning invalid meta-gradients."""
+    config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
+    results = run_distributed_test(
+        _test_ddp_rejects_higher_order_worker,
+        config,
+        timeout_per_rank=30.0,
+    )
+    assert results == ["success"] * 4
+
+
+def _test_gradient_reduction_higher_order_worker(rank, world_size, args):
+    """Differentiate through an explicitly normalized DeepInv collective."""
+    with DistributedContext(
+        device_mode="cpu",
+        inner_world_size=world_size,
+        gradient_reduction=args["reduction"],
+    ) as ctx:
+        x = torch.tensor(float(rank + 1), device=ctx.device, requires_grad=True)
+        synchronized = DistributedGradientSync.apply(x, ctx)
+        grad1 = torch.autograd.grad(synchronized.pow(3) / 3.0, x, create_graph=True)[0]
+        grad2 = torch.autograd.grad(grad1, x)[0]
+        return grad1.item(), grad2.item()
+
+
+@pytest.mark.parametrize(
+    ("reduction", "expected_grad1", "expected_grad2"),
+    [
+        ("mean", 2.5, [3.0, 3.0]),
+        ("sum", 5.0, [12.0, 12.0]),
+    ],
+)
+def test_gradient_reduction_is_invariant_for_higher_order(
+    reduction, expected_grad1, expected_grad2
+):
+    """SUM/mean semantics must not change when create_graph is enabled."""
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    results = run_distributed_test(
+        _test_gradient_reduction_higher_order_worker,
+        config,
+        {"reduction": reduction},
+        timeout_per_rank=20.0,
+    )
+    assert [result[0] for result in results] == pytest.approx(
+        [expected_grad1, expected_grad1]
+    )
+    assert [result[1] for result in results] == pytest.approx(expected_grad2)
 
 
 # =============================================================================
@@ -2235,10 +2503,11 @@ def _test_unrolled_backward_worker(rank, world_size, args):
                 f"max={diff_steps.max().item():.3e}"
             )
 
-        # Parameter gradients are accumulated patch-by-patch and then across
-        # ranks. Checkpointing recomputes those patches during backward, so the
-        # summation order is not identical to the single-process reference.
-        param_atol = 1e-2 if ctx.world_size > 1 else 5e-3
+        # Parameter gradients pass through overlapping patch reductions and,
+        # in multi-process runs, cross-rank reductions. CUDA can vary their
+        # floating-point accumulation order even when cuDNN is deterministic;
+        # the relative tolerance still guards gradients whose entries are large.
+        param_atol = 1e-2
         for i, (p_dist, p_ref) in enumerate(
             zip(denoiser.parameters(), denoiser_ref.parameters(), strict=True)
         ):

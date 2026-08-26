@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 import warnings
 
 import torch
@@ -12,10 +12,49 @@ from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 
+def _reject_ddp_higher_order_gradient(grad):
+    """Reject DDP reduction before it mutates a differentiable gradient."""
+    if torch.is_grad_enabled() or grad.requires_grad:
+        raise RuntimeError(
+            "Higher-order gradients are not supported by "
+            "DistributedContext.distributed_data_parallel(). Use the "
+            "autograd-aware DeepInv synchronization path without DDP instead."
+        )
+    return grad
+
+
+def _global_gradient_allreduce_hook(ctx, bucket):
+    r"""Reduce one DDP gradient bucket over the complete process topology.
+
+    DDP normally reduces over ``ctx.dp_group`` only. A distributed DeepInv model
+    also partitions one sample over ``ctx.inner_group``, so its final parameter
+    gradient must contain both dimensions. Performing one global collective
+    makes DDP the sole owner of the final first-order gradient and avoids racing
+    its asynchronous bucket write against DeepInv's end-of-backward callback.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            "Higher-order gradients are not supported by "
+            "DistributedContext.distributed_data_parallel(). Use the "
+            "autograd-aware DeepInv synchronization path without DDP instead."
+        )
+
+    tensor = bucket.buffer()
+    if ctx.gradient_reduction == "mean":
+        # Divide before the SUM, as PyTorch's default DDP hook does, to reduce
+        # the chance of overflow for low-precision gradients.
+        tensor.div_(ctx.global_world_size)
+    return (
+        dist.all_reduce(tensor, group=dist.group.WORLD, async_op=True)
+        .get_future()
+        .then(lambda future: future.value()[0])
+    )
+
+
 class DistributedContext:
     r"""Context manager for distributed computing.
 
-    
+
      Handles:
     - Initialization/destruction of the process group (if `RANK` / `WORLD_SIZE` environment variables exist)
     - Backend choice: NCCL when one-GPU-per-process per node, else Gloo.
@@ -44,6 +83,11 @@ class DistributedContext:
     :param str | None device_mode: ``'cpu'``, ``'gpu'``, or automatic if ``None``.
     :param int | None inner_world_size: processes cooperating on one sample. It
         must divide the global world size. ``None`` preserves legacy behavior.
+    :param {"mean", "sum"} gradient_reduction: reduction applied when DeepInv
+        synchronizes replicated parameter and input gradients. ``"mean"``
+        keeps gradient scale independent of the process count and is the
+        default. The selected operation has the same meaning for first- and
+        higher-order gradients.
     """
 
     def __init__(
@@ -55,6 +99,7 @@ class DistributedContext:
         deterministic: bool = False,
         device_mode: str | None = None,
         inner_world_size: int | None = None,
+        gradient_reduction: Literal["mean", "sum"] = "mean",
     ):
         if inner_world_size is not None and (
             isinstance(inner_world_size, bool)
@@ -62,6 +107,8 @@ class DistributedContext:
             or inner_world_size < 1
         ):
             raise ValueError("inner_world_size must be a positive integer or None")
+        if gradient_reduction not in ("mean", "sum"):
+            raise ValueError("gradient_reduction must be either 'mean' or 'sum'")
 
         self.backend = backend
         self.cleanup = cleanup
@@ -70,6 +117,7 @@ class DistributedContext:
         self.deterministic = deterministic
         self.device_mode = device_mode
         self._requested_inner_world_size = inner_world_size
+        self.gradient_reduction = gradient_reduction
 
         self.created_dist = False
         self.use_dist = False
@@ -93,6 +141,7 @@ class DistributedContext:
         self._dist_wrapper_cache: dict[str, Callable[..., Any]] = {}
         self._param_sync_scheduled_tasks: set[int] = set()
         self._param_sync_pending: dict[int, dict[int, torch.nn.Parameter]] = {}
+        self._ddp_managed_parameter_ids: set[int] = set()
 
     def __enter__(self):
         # Detect whether we should initialize a process group
@@ -310,11 +359,18 @@ class DistributedContext:
     def distributed_data_parallel(
         self, module: torch.nn.Module, **kwargs
     ) -> torch.nn.Module:
-        r"""Wrap a module with PyTorch DDP over the data-parallel group.
+        r"""Wrap a module with PyTorch DDP and synchronize its gradients.
 
         The module is returned unchanged for a single data-parallel replica.
         DeepInv objects should first be passed to
         :func:`deepinv.distributed.distribute`.
+
+        DDP manages ordinary data-parallel gradients over ``dp_group``. When
+        inner parallelism is also active, a communication hook reduces complete
+        gradient buckets over the global group, which is equivalent to reducing
+        over both orthogonal topology dimensions. Higher-order differentiation
+        through the DDP reducer is intentionally rejected; use the functional
+        DeepInv-only path for autograd-aware communication.
         """
         if "process_group" in kwargs:
             raise TypeError(
@@ -328,7 +384,37 @@ class DistributedContext:
         if self.device.type == "cuda" and "device_ids" not in kwargs:
             kwargs["device_ids"] = [self.device.index]
             kwargs.setdefault("output_device", self.device.index)
-        return DistributedDataParallel(module, process_group=self.dp_group, **kwargs)
+        incompatible = [
+            parameter
+            for parameter in module.parameters()
+            if getattr(
+                parameter,
+                "_deepinv_gradient_reduction",
+                self.gradient_reduction,
+            )
+            != self.gradient_reduction
+        ]
+        if incompatible:
+            raise ValueError(
+                "DDP-managed parameters must use ctx.gradient_reduction; "
+                "remove the per-parameter average override or align it with the context"
+            )
+        ddp = DistributedDataParallel(module, process_group=self.dp_group, **kwargs)
+        self._ddp_managed_parameter_ids.update(id(p) for p in module.parameters())
+        # Tensor hooks run before AccumulateGrad and DDP's reducer, allowing a
+        # clear error before DDP performs unsupported in-place bucket operations.
+        ddp._deepinv_higher_order_guard_handles = [
+            parameter.register_hook(_reject_ddp_higher_order_gradient)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
+        if self.inner_world_size > 1:
+            ddp.register_comm_hook(self, _global_gradient_allreduce_hook)
+        return ddp
+
+    def is_ddp_managed_parameter(self, parameter: torch.nn.Parameter) -> bool:
+        r"""Return whether DDP owns synchronization for ``parameter``."""
+        return id(parameter) in self._ddp_managed_parameter_ids
 
     def _default_group(self, group):
         return self.inner_group if group is None else group

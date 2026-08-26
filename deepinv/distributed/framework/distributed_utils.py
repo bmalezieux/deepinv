@@ -270,18 +270,16 @@ class DistributedGradientSync(torch.autograd.Function):
     @staticmethod
     def backward(autograd_ctx, grad_output):
         if autograd_ctx.dist_ctx.use_dist and grad_output is not None:
-            higher_order_path = grad_output.requires_grad
             # Use returned tensor so functional all_reduce paths (create_graph=True)
             # are preserved for higher-order differentiation.
             grad_output = autograd_ctx.dist_ctx.all_reduce(
                 grad_output, op=dist.ReduceOp.SUM
             )
-            # First-order training expects "mean across ranks" semantics:
-            # all_reduce gives a SUM, so we divide by world_size.
-            # Higher-order path (grad_output.requires_grad=True): this gradient is
-            # part of a new graph (e.g. create_graph=True). We keep the SUM here to
-            # avoid injecting hidden scaling into second-order/meta-gradients.
-            if autograd_ctx.dist_ctx.inner_world_size > 1 and not higher_order_path:
+            # Reduction semantics must not change with differentiation order.
+            if (
+                autograd_ctx.dist_ctx.gradient_reduction == "mean"
+                and autograd_ctx.dist_ctx.inner_world_size > 1
+            ):
                 grad_output = grad_output / float(
                     autograd_ctx.dist_ctx.inner_world_size
                 )
@@ -292,6 +290,11 @@ class DistributedParameterSync(torch.autograd.Function):
     """
     Autograd function that reduces parameters gradients at the end of backward.
     Used to synchronize model updates in distributed processing.
+
+    The callback is retained for inner-only execution and ignored for parameters
+    owned by DDP. Its SUM/mean semantics come from
+    ``ctx.gradient_reduction`` and remain unchanged during
+    higher-order differentiation.
     """
 
     @staticmethod
@@ -305,7 +308,16 @@ class DistributedParameterSync(torch.autograd.Function):
         if autograd_ctx.dist_ctx.use_dist:
             # Queue synchronization at end-of-backward, when all grads are accumulated.
             dist_ctx = autograd_ctx.dist_ctx
-            params = autograd_ctx.parameters
+            # DDP-owned parameters are reduced by its communication hook. Mixing
+            # this callback with DDP bucket finalization can overwrite one of the
+            # two reductions and desynchronize inner ranks.
+            params = [
+                p
+                for p in autograd_ctx.parameters
+                if not dist_ctx.is_ddp_managed_parameter(p)
+            ]
+            if not params:
+                return (grad_output, None) + (None,) * len(autograd_ctx.parameters)
             graph_task_id = torch._C._current_graph_task_id()
             scheduled = dist_ctx._param_sync_scheduled_tasks
             pending = dist_ctx._param_sync_pending.setdefault(graph_task_id, {})
@@ -327,13 +339,9 @@ class DistributedParameterSync(torch.autograd.Function):
                             # Preserve functional all_reduce result when p.grad requires_grad
                             # (e.g., backward called with create_graph=True).
                             p.grad = dist_ctx.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                            # Same rule as for input gradients:
-                            # - first-order parameter grads: average (SUM/world_size),
-                            # - higher-order grads (requires_grad=True): keep SUM so
-                            #   any normalization is explicit in the objective.
                             if (
-                                dist_ctx.inner_world_size > 1
-                                and not p.grad.requires_grad
+                                dist_ctx.gradient_reduction == "mean"
+                                and dist_ctx.inner_world_size > 1
                             ):
                                 p.grad = p.grad / float(dist_ctx.inner_world_size)
                     finally:
@@ -354,17 +362,25 @@ class DistributedReplicatedParameters:
     This class targets parameters that are replicated on all ranks (e.g. trainable
     step sizes in unrolled algorithms) and are not otherwise handled by
     :class:`DistributedProcessing`.
+
+    :param DistributedContext ctx: distributed execution context.
+    :param parameters: replicated trainable parameters.
+    :param bool | None average: override the context reduction with mean
+        (``True``) or sum (``False``). By default, use
+        ``ctx.gradient_reduction``.
     """
 
     def __init__(
         self,
         ctx: DistributedContext,
         parameters: Sequence[torch.nn.Parameter],
-        average: bool = True,
+        average: bool | None = None,
     ):
         self.ctx = ctx
-        self.average = average
+        self.average = ctx.gradient_reduction == "mean" if average is None else average
         self.parameters = [p for p in parameters if isinstance(p, torch.nn.Parameter)]
+        for parameter in self.parameters:
+            parameter._deepinv_gradient_reduction = "mean" if self.average else "sum"
         self._hooks = []
         self._register_hooks()
 
@@ -372,18 +388,20 @@ class DistributedReplicatedParameters:
         if grad is None or not self.ctx.use_dist:
             return grad
         grad = self.ctx.all_reduce(grad, op=dist.ReduceOp.SUM)
-        # For standard first-order optimization, users usually expect averaged grads:
-        # all_reduce returns SUM, so we divide by world_size when requested.
-        # If grad.requires_grad=True, we are in a higher-order path and this tensor
-        # is itself differentiable; keep SUM to avoid hidden scaling in meta-grads.
-        if self.average and self.ctx.inner_world_size > 1 and not grad.requires_grad:
+        # Keep the declared reduction invariant across differentiation orders.
+        if self.average and self.ctx.inner_world_size > 1:
             grad = grad / float(self.ctx.inner_world_size)
         return grad
 
     def _post_accumulate_hook(self, p: torch.nn.Parameter):
-        if p.grad is None:
+        if p.grad is None or self.ctx.is_ddp_managed_parameter(p):
             return
         p.grad = self._sync_grad_value(p.grad)
+
+    def _pre_accumulate_hook(self, p, grad):
+        if self.ctx.is_ddp_managed_parameter(p):
+            return grad
+        return self._sync_grad_value(grad)
 
     def _register_hooks(self):
         for p in self.parameters:
@@ -393,7 +411,9 @@ class DistributedReplicatedParameters:
                 h = p.register_post_accumulate_grad_hook(self._post_accumulate_hook)
             else:
                 # Fallback for older torch versions.
-                h = p.register_hook(self._sync_grad_value)
+                h = p.register_hook(
+                    lambda grad, parameter=p: self._pre_accumulate_hook(parameter, grad)
+                )
             self._hooks.append(h)
 
     def remove_hooks(self):

@@ -159,8 +159,12 @@ for one sample first, then wrap it with DDP across replicas:
     model = distribute(model, ctx, patch_size=256, overlap=64)
     model = ctx.distributed_data_parallel(model)
 
-This method is a thin wrapper around PyTorch DDP with
-``process_group=ctx.dp_group``. Standard DDP options can be passed directly:
+This method constructs PyTorch DDP with ``process_group=ctx.dp_group``.
+When inner parallelism is also active, DeepInv installs a DDP communication
+hook that reduces complete gradient buckets over the global process group. This
+single owner avoids races between DDP bucket finalization and DeepInv's
+end-of-backward parameter synchronization. Standard DDP options can be passed
+directly:
 
 .. code-block:: python
 
@@ -171,13 +175,47 @@ This method is a thin wrapper around PyTorch DDP with
     )
 
 When there is only one data-parallel replica, the method returns the original
-model unchanged. Advanced users can instead pass ``ctx.dp_group`` directly to
-:class:`torch.nn.parallel.DistributedDataParallel`.
+model unchanged and DeepInv continues to synchronize gradients over the inner
+group. Do not replace :meth:`DistributedContext.distributed_data_parallel
+<deepinv.distributed.DistributedContext.distributed_data_parallel>` with a
+manual DDP wrapper in a hierarchical configuration: the manual wrapper would
+omit DeepInv's global gradient-bucket hook.
 
-The two gradient reductions have different roles. DeepInv combines contributions
-from the ranks decomposing one inverse problem; DDP then averages the resulting
-sample gradients across independent replicas. PyTorch retains responsibility for
-gradient bucketing, asynchronous reductions, and communication overlap.
+The logical reduction still has two roles: combining contributions from ranks
+that decompose one inverse problem, and combining independent sample gradients.
+In hierarchical DDP these operations are implemented as one bucket collective.
+DDP waits until all uses of a parameter have accumulated, so repeated calls to
+the same denoiser in an unfolded model are reduced once per backward pass.
+
+Gradient Reduction Semantics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Gradient synchronization uses an explicit reduction selected on the context:
+
+.. code-block:: python
+
+    with DistributedContext(
+        inner_world_size=4,
+        gradient_reduction="mean",
+    ) as ctx:
+        ...
+
+``"mean"`` is the default and keeps gradient scale independent of the number
+of participating processes. ``"sum"`` preserves the unnormalized sum. The
+selected meaning does not change when differentiating through the functional
+DeepInv synchronization path.
+The legacy ``average`` option for explicitly distributed parameters overrides
+the context outside DDP. A DDP model requires all its parameters to agree with
+``ctx.gradient_reduction``, because one bucket cannot safely mix SUM and mean
+semantics.
+
+DDP gradient buckets support first-order training only. Calling backward with
+``create_graph=True`` on a model returned by
+``ctx.distributed_data_parallel()`` raises an explicit error instead of
+silently producing invalid meta-gradients. Higher-order differentiation remains
+available without DDP, where DeepInv uses autograd-aware functional
+collectives. This limitation does not affect repeated denoiser calls in ordinary
+first-order training.
 
 
 Simple Training Pattern

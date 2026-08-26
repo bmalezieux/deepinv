@@ -226,7 +226,7 @@ def _distribute_replicated_parameters(
     params: torch.nn.Parameter | Sequence[torch.nn.Parameter],
     ctx: DistributedContext,
     *,
-    average: bool = True,
+    average: bool | None = None,
 ):
     r"""
     Attach distributed gradient synchronization to replicated parameters.
@@ -259,7 +259,7 @@ def _distribute_base_optim(
     model: BaseOptim,
     ctx: DistributedContext,
     *,
-    average: bool = True,
+    average: bool | None = None,
     tiling_strategy: DistributedSignalStrategy | None = None,
     patch_size: int = 256,
     overlap: int = 64,
@@ -299,7 +299,8 @@ def _distribute_base_optim(
     :param BaseOptim model: unfolded model (``model.unfold`` must be ``True``),
         modified **in-place**.
     :param DistributedContext ctx: distributed context.
-    :param bool average: average gradients across ranks. Default ``True``.
+    :param bool | None average: override ``ctx.gradient_reduction`` for
+        replicated algorithm parameters. Default ``None``.
     :param DistributedSignalStrategy | None tiling_strategy: tiling strategy
         forwarded to every :class:`DistributedProcessing` created. Default ``None``
         (falls back to the default tiling strategy).
@@ -621,7 +622,7 @@ def distribute(
                 "unfolded (trainable) models can be distributed via this path. "
                 "Distribute physics and denoisers separately instead."
             )
-        average = kwargs.pop("average", True)
+        average = kwargs.pop("average", None)
         if kwargs:
             raise TypeError(
                 "Unsupported keyword arguments for type_object='module': "
