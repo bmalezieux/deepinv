@@ -204,10 +204,23 @@ Gradient synchronization uses an explicit reduction selected on the context:
 of participating processes. ``"sum"`` preserves the unnormalized sum. The
 selected meaning does not change when differentiating through the functional
 DeepInv synchronization path.
+Pure data parallelism (``inner_world_size=1``) uses PyTorch standard DDP
+reducer, which always averages gradients. DeepInv therefore rejects
+``gradient_reduction="sum"`` in that configuration instead of silently
+performing a different reduction. Hierarchical and inner-only configurations
+support both options.
 The legacy ``average`` option for explicitly distributed parameters overrides
 the context outside DDP. A DDP model requires all its parameters to agree with
 ``ctx.gradient_reduction``, because one bucket cannot safely mix SUM and mean
 semantics.
+
+DDP accepts an :class:`torch.nn.Module`, not a standalone
+:class:`torch.nn.Parameter`. Parameters that should participate in data
+parallel synchronization must be registered on the wrapped module. In
+particular, :func:`deepinv.distributed.distribute` automatically registers and
+synchronizes the ``params_algo`` parameters of an unfolded ``BaseOptim`` model.
+An explicitly distributed parameter that remains outside the DDP-wrapped model
+is synchronized only over the inner group.
 
 DDP gradient buckets support first-order training only. Calling backward with
 ``create_graph=True`` on a model returned by

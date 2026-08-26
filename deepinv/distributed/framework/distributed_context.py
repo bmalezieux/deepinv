@@ -371,7 +371,17 @@ class DistributedContext:
         over both orthogonal topology dimensions. Higher-order differentiation
         through the DDP reducer is intentionally rejected; use the functional
         DeepInv-only path for autograd-aware communication.
+
+        :raises TypeError: if ``module`` is not a :class:`torch.nn.Module`.
+        :raises ValueError: if ``gradient_reduction="sum"`` is requested for
+            pure data parallelism, where PyTorch standard DDP reducer always
+            averages gradients.
         """
+        if not isinstance(module, torch.nn.Module):
+            raise TypeError(
+                "distributed_data_parallel() expects a torch.nn.Module; "
+                "register standalone parameters on a module before wrapping it"
+            )
         if "process_group" in kwargs:
             raise TypeError(
                 "distributed_data_parallel() selects ctx.dp_group; "
@@ -379,6 +389,11 @@ class DistributedContext:
             )
         if self.dp_world_size == 1:
             return module
+        if self.inner_world_size == 1 and self.gradient_reduction == "sum":
+            raise ValueError(
+                "gradient_reduction=sum is not supported with pure DDP; "
+                "use gradient_reduction=mean"
+            )
         if not self.use_dist or self.dp_group is None:
             raise RuntimeError("The data-parallel process group is not initialized")
         if self.device.type == "cuda" and "device_ids" not in kwargs:

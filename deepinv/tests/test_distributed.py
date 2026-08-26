@@ -1478,6 +1478,33 @@ def test_pure_ddp_gradient_sync():
     assert gradients == pytest.approx([1.5, 1.5])
 
 
+def _test_pure_ddp_rejects_sum_worker(rank, world_size, args):
+    """Pure DDP must reject SUM instead of silently applying its mean."""
+    with DistributedContext(
+        device_mode="cpu", inner_world_size=1, gradient_reduction="sum"
+    ) as ctx:
+        with pytest.raises(ValueError, match="not supported with pure DDP"):
+            ctx.distributed_data_parallel(torch.nn.Linear(1, 1))
+        return "success"
+
+
+def test_pure_ddp_rejects_sum_reduction():
+    """The requested reduction must never differ from the performed one."""
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    results = run_distributed_test(
+        _test_pure_ddp_rejects_sum_worker, config, timeout_per_rank=20.0
+    )
+    assert results == ["success", "success"]
+
+
+def test_ddp_rejects_bare_parameter():
+    """DDP requires parameters to be registered on an nn.Module."""
+    with DistributedContext(device_mode="cpu") as ctx:
+        parameter = torch.nn.Parameter(torch.ones(1))
+        with pytest.raises(TypeError, match="expects a torch.nn.Module"):
+            ctx.distributed_data_parallel(parameter)
+
+
 class _MultiLayerDenoiser(Denoiser):
     """Small multi-parameter denoiser used to exercise several DDP buckets."""
 
