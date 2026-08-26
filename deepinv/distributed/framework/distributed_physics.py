@@ -75,7 +75,7 @@ class DistributedStackedPhysics(Physics):
         # Broadcast shared object (lightweight) once (root=0) if present
         self.factory_kwargs = factory_kwargs
         if ctx.use_dist and factory_kwargs is not None:
-            obj = [factory_kwargs if ctx.rank == 0 else None]
+            obj = [factory_kwargs if ctx.inner_rank == 0 else None]
             self.ctx.broadcast_object_list(obj, src=0)
             self.factory_kwargs = obj[0]
 
@@ -488,7 +488,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
             # Global computation: call parent class A_dagger which uses least squares
             # This will use our distributed A, A_adjoint, A_adjoint_A and A_A_adjoint
             # XXX: this could use a dedicated algorithm to faster computations
-            verbose_flag = verbose and self.ctx.rank == 0
+            verbose_flag = verbose and self.ctx.inner_rank == 0
             return super().A_dagger(
                 y,
                 solver=solver,
@@ -550,7 +550,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
                 **kwargs,
             )
 
-            if verbose and self.ctx.rank == 0 and gather:
+            if verbose and self.ctx.inner_rank == 0 and gather:
                 print(
                     f"Computed local norm upper bound: ||A||_2^2 ≤ {local_sqnorm.item():.2f}"
                 )
@@ -560,7 +560,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         else:
             # Global computation: call parent class compute_sqnorm which uses power method
             # This will use our distributed A_adjoint_A
-            verbose_flag = verbose and self.ctx.rank == 0
+            verbose_flag = verbose and self.ctx.inner_rank == 0
             return super().compute_sqnorm(
                 x0, max_iter=max_iter, tol=tol, verbose=verbose_flag, **kwargs
             )

@@ -212,7 +212,7 @@ def reduce_local_results(
     # 2. Shape synchronization (Broadcast from Rank 0)
     # Required for all_reduce to work if ranks have different Shapes (e.g. rank 0 has results, rank 1 has none)
     if ctx.use_dist and reduce_op is not None:
-        if ctx.rank == 0:
+        if ctx.inner_rank == 0:
             ndim = torch.tensor([local_val.ndim], device=ctx.device, dtype=torch.long)
         else:
             ndim = torch.zeros(1, device=ctx.device, dtype=torch.long)
@@ -221,7 +221,7 @@ def reduce_local_results(
         D = ndim.item()
 
         if D > 0:  # Only if rank 0 result is not a scalar
-            if ctx.rank == 0:
+            if ctx.inner_rank == 0:
                 shape = torch.tensor(
                     local_val.shape, device=ctx.device, dtype=torch.long
                 )
@@ -281,8 +281,10 @@ class DistributedGradientSync(torch.autograd.Function):
             # Higher-order path (grad_output.requires_grad=True): this gradient is
             # part of a new graph (e.g. create_graph=True). We keep the SUM here to
             # avoid injecting hidden scaling into second-order/meta-gradients.
-            if autograd_ctx.dist_ctx.world_size > 1 and not higher_order_path:
-                grad_output = grad_output / float(autograd_ctx.dist_ctx.world_size)
+            if autograd_ctx.dist_ctx.inner_world_size > 1 and not higher_order_path:
+                grad_output = grad_output / float(
+                    autograd_ctx.dist_ctx.inner_world_size
+                )
         return grad_output, None
 
 
@@ -329,8 +331,11 @@ class DistributedParameterSync(torch.autograd.Function):
                             # - first-order parameter grads: average (SUM/world_size),
                             # - higher-order grads (requires_grad=True): keep SUM so
                             #   any normalization is explicit in the objective.
-                            if dist_ctx.world_size > 1 and not p.grad.requires_grad:
-                                p.grad = p.grad / float(dist_ctx.world_size)
+                            if (
+                                dist_ctx.inner_world_size > 1
+                                and not p.grad.requires_grad
+                            ):
+                                p.grad = p.grad / float(dist_ctx.inner_world_size)
                     finally:
                         scheduled.discard(graph_task_id)
 
@@ -371,8 +376,8 @@ class DistributedReplicatedParameters:
         # all_reduce returns SUM, so we divide by world_size when requested.
         # If grad.requires_grad=True, we are in a higher-order path and this tensor
         # is itself differentiable; keep SUM to avoid hidden scaling in meta-grads.
-        if self.average and self.ctx.world_size > 1 and not grad.requires_grad:
-            grad = grad / float(self.ctx.world_size)
+        if self.average and self.ctx.inner_world_size > 1 and not grad.requires_grad:
+            grad = grad / float(self.ctx.inner_world_size)
         return grad
 
     def _post_accumulate_hook(self, p: torch.nn.Parameter):
@@ -435,7 +440,7 @@ def gather_tensorlist_naive(
     pairs = list(zip(local_indices, local_results, strict=True))
 
     # Gather all pairs from all ranks
-    gathered = [None] * ctx.world_size
+    gathered = [None] * ctx.inner_world_size
     ctx.all_gather_object(gathered, pairs)
 
     # Assemble into output list
@@ -477,7 +482,7 @@ def gather_tensorlist_concatenated(
         for idx, result in zip(local_indices, local_results, strict=True)
     ]
 
-    gathered_metadata = [None] * ctx.world_size
+    gathered_metadata = [None] * ctx.inner_world_size
     ctx.all_gather_object(gathered_metadata, local_metadata)
 
     # Flatten all metadata
@@ -628,7 +633,7 @@ def gather_tensorlist_broadcast(
         for idx, result in zip(local_indices, local_results, strict=True)
     ]
 
-    gathered_metadata = [None] * ctx.world_size
+    gathered_metadata = [None] * ctx.inner_world_size
     ctx.all_gather_object(gathered_metadata, local_metadata)
 
     # Build shape map
@@ -644,7 +649,7 @@ def gather_tensorlist_broadcast(
 
     for idx in range(num_operators):
         shape, dtype = shape_map[idx]
-        responsible_rank = idx % ctx.world_size  # Round-robin sharding
+        responsible_rank = idx % ctx.inner_world_size  # Round-robin sharding
 
         # Prepare tensor to send/receive
         if idx in local_indices:
@@ -655,9 +660,13 @@ def gather_tensorlist_broadcast(
             # Create receive buffer (needs to be right shape and device)
             tensor_to_send = torch.zeros(shape, dtype=dtype, device=ctx.device)
 
-        # Broadcast using functional API for autograd support
-        # dist_nn.broadcast returns the tensor (input on src, received on others)
-        tensor_to_send = dist_nn.broadcast(tensor_to_send, src=responsible_rank)
+        # Use the functional operation on every rank so the received tensor stays
+        # connected to autograd, and explicitly scope it to the inner group.
+        tensor_to_send = dist_nn.broadcast(
+            tensor_to_send,
+            src=ctx.inner_group_ranks[responsible_rank],
+            group=ctx.inner_group,
+        )
         out[idx] = tensor_to_send
 
     return TensorList(out)

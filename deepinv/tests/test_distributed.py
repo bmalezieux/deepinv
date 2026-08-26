@@ -40,6 +40,7 @@ from deepinv.distributed.framework import (
     DistributedStackedLinearPhysics,
     DistributedProcessing,
     DistributedDataFidelity,
+    DistributedReplicatedParameters,
 )
 from deepinv.distributed.distribute import (
     distribute,
@@ -1230,6 +1231,108 @@ def test_distributed_context_collectives(device_config):
         _test_distributed_context_collectives_worker, device_config, test_args
     )
     assert all(r == "success" for r in results)
+
+
+def _test_hierarchical_parallelism_worker(rank, world_size, args):
+    """Exercise both dimensions of a two-by-two CPU process topology."""
+    with DistributedContext(device_mode="cpu", inner_world_size=2, seed=123) as ctx:
+        assert ctx.global_rank == rank
+        assert ctx.global_world_size == world_size
+        assert ctx.rank == rank
+        assert ctx.world_size == world_size
+        assert ctx.inner_rank == rank % 2
+        assert ctx.inner_world_size == 2
+        assert ctx.dp_rank == rank // 2
+        assert ctx.dp_world_size == 2
+        assert ctx.inner_group_ranks == ([0, 1] if rank < 2 else [2, 3])
+        assert ctx.dp_group_ranks == ([0, 2] if rank % 2 == 0 else [1, 3])
+
+        # Context collectives default to the row/inner group.
+        inner_value = torch.tensor(float(rank + 1))
+        inner_sum = ctx.all_reduce(inner_value)
+        assert inner_sum.item() == (3.0 if rank < 2 else 7.0)
+
+        # The raw column group remains available for explicit operations.
+        dp_value = torch.tensor(float(rank + 1))
+        dp_sum = ctx.all_reduce(dp_value, group=ctx.dp_group)
+        assert dp_sum.item() == (4.0 if rank % 2 == 0 else 6.0)
+
+        broadcast_value = torch.tensor(float(rank) if ctx.inner_rank == 0 else -1.0)
+        ctx.broadcast(broadcast_value, src=0)
+        assert broadcast_value.item() == float((rank // 2) * 2)
+
+        assert ctx.local_indices(6) == list(range(ctx.inner_rank, 6, 2))
+
+        # Explicit hierarchical mode seeds by replica: equal within a row and
+        # different between independent samples.
+        random_value = torch.rand(1).item()
+
+        dataset = list(range(8))
+        sampler = ctx.distributed_data_sampler(dataset, shuffle=False)
+        sample_indices = list(iter(sampler))
+        expected_indices = [0, 2, 4, 6] if ctx.dp_rank == 0 else [1, 3, 5, 7]
+        assert sample_indices == expected_indices
+
+        # A real DeepInv gather must stay inside the row. Distinct replica inputs
+        # make accidental communication through the global world observable.
+        physics_list = create_test_physics_list(ctx.device, num_operators=2)
+        distributed_physics = distribute(physics_list, ctx, gather_strategy="broadcast")
+        physics_input = torch.full((1, 1, 8, 8), float(ctx.dp_rank + 1))
+        distributed_outputs = distributed_physics.A(physics_input)
+        reference_outputs = [physics.A(physics_input) for physics in physics_list]
+        assert all(
+            torch.allclose(actual, expected)
+            for actual, expected in zip(
+                distributed_outputs, reference_outputs, strict=True
+            )
+        )
+
+        # Compose DeepInv's inner replicated-gradient synchronization with DDP's
+        # outer averaging. Replica inputs are 1/2, inner multipliers are 1/2:
+        # mean_inner(mean_dp(input)) = 2.25.
+        model = torch.nn.Linear(1, 1, bias=False)
+        DistributedReplicatedParameters(ctx, model.parameters())
+        model = ctx.distributed_data_parallel(model)
+        assert isinstance(model, torch.nn.parallel.DistributedDataParallel)
+        x = torch.tensor([[float((ctx.dp_rank + 1) * (ctx.inner_rank + 1))]])
+        model(x).sum().backward()
+        parameter = next(model.parameters())
+        assert torch.allclose(parameter.grad, torch.tensor([[2.25]]))
+
+        return {
+            "rank": rank,
+            "random_value": random_value,
+            "sample_indices": sample_indices,
+            "gradient": parameter.grad.item(),
+        }
+
+
+def test_hierarchical_parallelism():
+    """Test row-wise DeepInv distribution and column-wise data parallelism."""
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multi-process tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
+    results = run_distributed_test(
+        _test_hierarchical_parallelism_worker,
+        config,
+        timeout_per_rank=20.0,
+    )
+
+    assert results[0]["random_value"] == results[1]["random_value"]
+    assert results[2]["random_value"] == results[3]["random_value"]
+    assert results[0]["random_value"] != results[2]["random_value"]
+    assert results[0]["sample_indices"] == results[1]["sample_indices"]
+    assert results[2]["sample_indices"] == results[3]["sample_indices"]
+    assert all(result["gradient"] == pytest.approx(2.25) for result in results)
+
+
+def test_distributed_context_invalid_inner_world_size():
+    """The inner process count must be positive and divide the global world."""
+    with pytest.raises(ValueError, match="positive integer"):
+        DistributedContext(inner_world_size=0)
+    with pytest.raises(ValueError, match="must divide"):
+        with DistributedContext(device_mode="cpu", inner_world_size=2):
+            pass
 
 
 # =============================================================================
