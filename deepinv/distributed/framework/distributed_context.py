@@ -15,6 +15,17 @@ from torch.utils.data.distributed import DistributedSampler
 class DistributedContext:
     r"""Context manager for distributed computing.
 
+    
+     Handles:
+    - Initialization/destruction of the process group (if `RANK` / `WORLD_SIZE` environment variables exist)
+    - Backend choice: NCCL when one-GPU-per-process per node, else Gloo.
+    - Device selection based on `LOCAL_RANK` and visible GPUs
+    - Sharding helpers and tiny communication helpers
+
+    .. note::
+        The world size refers to the total number of processes (usually one per GPU).
+        The rank of a process refers to its unique ID in the range [0, world_size-1].
+
     By default, all processes cooperate on one inverse problem. Setting
     ``inner_world_size`` creates a two-dimensional topology: contiguous groups
     of inner processes cooperate on one sample, while processes with the same
@@ -84,11 +95,15 @@ class DistributedContext:
         self._param_sync_pending: dict[int, dict[int, torch.nn.Parameter]] = {}
 
     def __enter__(self):
+        # Detect whether we should initialize a process group
         env_has_dist = ("RANK" in os.environ) and ("WORLD_SIZE" in os.environ)
         should_init_pg = (not dist.is_initialized()) and env_has_dist
 
+        # Count GPUs *visible to this process* (respects CUDA_VISIBLE_DEVICES)
         visible_gpus = torch.cuda.device_count()
         cuda_ok = torch.cuda.is_available() and visible_gpus > 0
+
+        # Get number of processes and ranks
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.global_rank = int(os.environ.get("RANK", 0))
@@ -97,6 +112,12 @@ class DistributedContext:
         if should_init_pg:
             backend = self.backend
             if backend is None:
+                # Backend decision considering device_mode:
+                #   - If device_mode is "cpu", always use Gloo
+                #   - If device_mode is "gpu", always use NCCL (will fail if no GPU)
+                #   - If auto (None), decide based on available resources:
+                #     * If each node has at least as many *visible* GPUs as processes per node -> NCCL
+                #     * Otherwise -> Gloo (e.g., GPU oversubscription or CPU)
                 if self.device_mode == "cpu":
                     backend = "gloo"
                 elif self.device_mode == "gpu":
@@ -116,6 +137,7 @@ class DistributedContext:
             dist.init_process_group(backend=backend)
             self.created_dist = True
 
+        # Refresh flags from the actual PG (in case we didn't init)
         self.use_dist = dist.is_initialized()
         if self.use_dist:
             self.global_world_size = dist.get_world_size()
@@ -123,6 +145,7 @@ class DistributedContext:
         self.rank = self.global_rank
         self.world_size = self.global_world_size
 
+        # ---- Device selection ----
         if self.device_mode == "cpu":
             self.device = torch.device("cpu")
         elif self.device_mode == "gpu":
@@ -152,6 +175,10 @@ class DistributedContext:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # Only destroy process group if:
+        # 1. cleanup=True (caller wants cleanup)
+        # 2. We initialized it (created_dist=True)
+        # 3. It's still initialized
         if self.cleanup and self.created_dist and dist.is_initialized():
             try:
                 dist.barrier()
