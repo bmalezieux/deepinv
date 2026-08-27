@@ -266,6 +266,7 @@ class DistributedGradientSync(torch.autograd.Function):
         if autograd_ctx.dist_ctx.use_dist and grad_output is not None:
             # Use returned tensor so functional all_reduce paths (create_graph=True)
             # are preserved for higher-order differentiation.
+            grad_output = grad_output.contiguous()
             grad_output = autograd_ctx.dist_ctx.all_reduce(
                 grad_output, op=dist.ReduceOp.SUM
             )
