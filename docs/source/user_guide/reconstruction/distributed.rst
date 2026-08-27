@@ -212,6 +212,65 @@ How It Works
 2. **Parallel Forward**: Each process computes :math:`A_i(x)` for its local operators
 3. **Parallel Adjoint**: Each process computes local adjoints, then results are summed via ``all_reduce``
 
+Pre-sharded physics and measurements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The default mode expects every rank to receive the full stack (or a factory) and
+lets DeepInv choose a round-robin partition. For operators that are expensive to
+construct, use ``from_shard=True`` to build only the operators owned by the
+current rank::
+
+    # Plain metadata can safely be passed to DataLoader workers.
+    global_indices = choose_planes(ctx.inner_rank, ctx.inner_world_size)
+    local_physics, local_y = build_only_these_planes(global_indices)
+
+    physics = distribute(
+        local_physics,
+        ctx,
+        type_object="linear_physics",
+        from_shard=True,
+        num_operators=32,
+        global_indices=global_indices,
+    )
+
+Here ``local_physics[k]``, ``local_y[k]``, and ``global_indices[k]`` describe the
+same global operator. DeepInv retains this order and never calls
+:meth:`deepinv.distributed.DistributedContext.local_indices` in sharded mode.
+Only the supplied local operators are transferred to ``ctx.device``.
+
+``num_operators`` is the global count and is always required. A rank with no
+operator passes ``physics=None`` and ``global_indices=None``; ``([], [])`` is an
+equivalent explicit form. Empty shards still participate in construction,
+forward gathers, reductions, and backward. Therefore **every inner rank must
+call** ``distribute(..., from_shard=True)`` in the same order: construction uses
+a collective to verify that the indices form an exact, duplicate-free partition
+of ``range(num_operators)``. Validation is scoped to ``ctx.inner_group``, so
+data-parallel replicas remain independent.
+
+Measurements stay sharded too. Pass the local list directly to distributed data
+fidelity, including ``None`` (or an empty list) on an empty rank::
+
+    data_fidelity = distribute(L2(), ctx)
+    gradient = data_fidelity.grad(x, local_y, physics)
+
+    # Local predictions; no measurement communication.
+    prediction_local = physics.A(x, gather=False)
+
+    # Optional globally ordered measurement result.
+    prediction_global = physics.A(x, gather=True)
+
+:meth:`~deepinv.distributed.DistributedDataFidelity.grad` reduces the final
+image-domain gradient; it does not gather measurements. A global measurement
+list is rejected in sharded mode. Generic ``prox`` is not currently supported
+for pre-sharded measurements and fails explicitly.
+
+For DataLoader pipelines, decide ownership before constructing the loader and
+pass only plain index metadata to workers. Workers should construct CPU physics
+and measurements but must not receive process groups, execute collectives, or
+perform CUDA work. See the :ref:`sharded physics example
+<sphx_glr_auto_examples_distributed_demo_sharded_physics.py>` for a runnable
+arbitrary-ownership example.
+
 Input Formats
 ~~~~~~~~~~~~~
 
@@ -503,6 +562,7 @@ See Also
 - **Examples**: 
 
   - :ref:`sphx_glr_auto_examples_distributed_demo_physics_distributed.py`
+  - :ref:`sphx_glr_auto_examples_distributed_demo_sharded_physics.py`
   - :ref:`sphx_glr_auto_examples_distributed_demo_denoiser_distributed.py`
   - :ref:`sphx_glr_auto_examples_distributed_demo_pnp_distributed.py`
 

@@ -12,12 +12,10 @@ The API is the same as for :ref:`distributed reconstruction <distributed>`:
 1. :class:`deepinv.distributed.DistributedContext` manages the processes and devices
 2. :func:`deepinv.distributed.distribute` converts deepinv objects to distributed versions
 
-.. note::
-
-    This is different from `data-parallel training offered by pytorch <https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html>`_.
-    In data parallelism, each GPU sees different images. Here, each rank works on different parts of
-    the same image or volume. Therefore, all ranks should usually iterate
-    over the same minibatches.
+DeepInv's intra-sample distribution can also be combined with `PyTorch
+DistributedDataParallel <https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html>`_
+(DDP). In that hierarchical configuration, small groups of ranks cooperate on
+large samples and DDP processes independent samples across those groups.
 
 .. warning::
 
@@ -100,6 +98,139 @@ framework distributes their data-fidelity terms, tiled denoisers, and trainable
 algorithm parameters.
 
 
+Data Parallelism
+----------------
+
+Using every available GPU for one sample minimizes the latency of that sample,
+but it is not generally the best way to maximize training throughput. Once an
+inverse problem fits on a smaller group of GPUs, the remaining GPUs can process
+independent samples concurrently. This is especially effective when each
+forward/backward pass is long, because DDP gradient communication is then small
+relative to the computation between synchronizations.
+
+For :math:`N` total processes and :math:`g` processes per sample, DeepInv can run
+
+.. math::
+
+    R = N/g
+
+independent replicas. If one sample takes :math:`T(g)`, the relevant benchmark is
+
+.. math::
+
+    Q(g) = \frac{N/g}{T(g)}.
+
+A useful rule is to use the minimum intra-sample parallelism that makes the
+problem memory-feasible and reasonably compute-efficient, then use the remaining
+processes for data parallelism. Activation checkpointing remains an independent
+trade-off: it reduces stored activations but does not reduce the instantaneous
+memory needed by a layer's feature maps.
+
+Configure the topology with ``inner_world_size``:
+
+.. code-block:: python
+
+    with DistributedContext(inner_world_size=4, seed=0) as ctx:
+        ...
+
+For 32 launched processes, this creates eight replicas with four inner ranks
+per sample. Contiguous ranks form the inner groups ``[0, 1, 2, 3]``,
+``[4, 5, 6, 7]``, and so on. Ranks at the same position in those groups form the
+DDP groups.
+
+The context exposes both coordinates and process groups:
+
+.. code-block:: python
+
+    ctx.global_rank
+    ctx.global_world_size
+    ctx.inner_group
+    ctx.inner_rank
+    ctx.inner_world_size
+    ctx.dp_group
+    ctx.dp_rank
+    ctx.dp_world_size
+
+DeepInv operations use ``ctx.inner_group`` automatically. Distribute the model
+for one sample first, then wrap it with DDP across replicas:
+
+.. code-block:: python
+
+    model = distribute(model, ctx, patch_size=256, overlap=64)
+    model = ctx.distributed_data_parallel(model)
+
+This method constructs PyTorch DDP with ``process_group=ctx.dp_group``.
+When inner parallelism is also active, DeepInv installs a DDP communication
+hook that reduces complete gradient buckets over the global process group. This
+single owner avoids races between DDP bucket finalization and DeepInv's
+end-of-backward parameter synchronization. Standard DDP options can be passed
+directly:
+
+.. code-block:: python
+
+    model = ctx.distributed_data_parallel(
+        model,
+        static_graph=True,
+        find_unused_parameters=False,
+    )
+
+When there is only one data-parallel replica, the method returns the original
+model unchanged and DeepInv continues to synchronize gradients over the inner
+group. Do not replace :meth:`DistributedContext.distributed_data_parallel
+<deepinv.distributed.DistributedContext.distributed_data_parallel>` with a
+manual DDP wrapper in a hierarchical configuration: the manual wrapper would
+omit DeepInv's global gradient-bucket hook.
+
+The logical reduction still has two roles: combining contributions from ranks
+that decompose one inverse problem, and combining independent sample gradients.
+In hierarchical DDP these operations are implemented as one bucket collective.
+DDP waits until all uses of a parameter have accumulated, so repeated calls to
+the same denoiser in an unfolded model are reduced once per backward pass.
+
+Gradient Reduction Semantics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Gradient synchronization uses an explicit reduction selected on the context:
+
+.. code-block:: python
+
+    with DistributedContext(
+        inner_world_size=4,
+        gradient_reduction="mean",
+    ) as ctx:
+        ...
+
+``"mean"`` is the default and keeps gradient scale independent of the number
+of participating processes. ``"sum"`` preserves the unnormalized sum. The
+selected meaning does not change when differentiating through the functional
+DeepInv synchronization path.
+Pure data parallelism (``inner_world_size=1``) uses PyTorch standard DDP
+reducer, which always averages gradients. DeepInv therefore rejects
+``gradient_reduction="sum"`` in that configuration instead of silently
+performing a different reduction. Hierarchical and inner-only configurations
+support both options.
+The legacy ``average`` option for explicitly distributed parameters overrides
+the context outside DDP. A DDP model requires all its parameters to agree with
+``ctx.gradient_reduction``, because one bucket cannot safely mix SUM and mean
+semantics.
+
+DDP accepts an :class:`torch.nn.Module`, not a standalone
+:class:`torch.nn.Parameter`. Parameters that should participate in data
+parallel synchronization must be registered on the wrapped module. In
+particular, :func:`deepinv.distributed.distribute` automatically registers and
+synchronizes the ``params_algo`` parameters of an unfolded ``BaseOptim`` model.
+An explicitly distributed parameter that remains outside the DDP-wrapped model
+is synchronized only over the inner group.
+
+DDP gradient buckets support first-order training only. Calling backward with
+``create_graph=True`` on a model returned by
+``ctx.distributed_data_parallel()`` raises an explicit error instead of
+silently producing invalid meta-gradients. Higher-order differentiation remains
+available without DDP, where DeepInv uses autograd-aware functional
+collectives. This limitation does not affect repeated denoiser calls in ordinary
+first-order training.
+
+
 Simple Training Pattern
 -----------------------
 
@@ -159,8 +290,8 @@ bars, it is usually best to do the visible work only on rank 0.
 Data Loading
 ------------
 
-Because the framework distributes one inverse problem across ranks, the
-dataloader should usually return the same batch on every rank.
+Without data parallelism, the dataloader should return the same batch on every
+rank because the full distributed world cooperates on one inverse problem.
 
 In practice:
 
@@ -169,10 +300,34 @@ In practice:
 - Move both images and measurements to ``ctx.device``.
 - If measurements are stored as a list or :class:`deepinv.utils.TensorList`, move each tensor to the device.
 
-This is different from Pytorch's data parallelism, where each process receives
-different samples and gradients are synchronized only between model replicas.
-There's no need for custom data loaders or samplers for the distributed framework,
-as long as all ranks operate on the same image/volume.
+With hierarchical data parallelism, samples must be sharded across replicas, not
+individual processes. Use the context helper:
+
+.. code-block:: python
+
+    sampler = ctx.distributed_data_sampler(dataset, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        sampler=sampler,
+    )
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)
+        for batch in train_loader:
+            ...
+
+All inner ranks receive the same indices, while different ``dp_rank`` values
+receive different dataset partitions. Do not construct a default
+:class:`torch.utils.data.distributed.DistributedSampler` over the global world,
+because that would give cooperating inner ranks different samples.
+
+When ``inner_world_size`` is explicitly configured, ``seed_offset=True`` offsets
+the context seed by ``dp_rank``. Inner ranks therefore start from the same random
+state and independent replicas use different states. Matching seeds are not
+enough if different inner ranks execute a different number of random operations;
+for stochastic physics, crops, masks, or measurement generation, generate random
+parameters on inner rank zero and broadcast them when strict agreement is needed.
 
 How Backward Works
 ------------------
@@ -239,6 +394,17 @@ Use ``torchrun`` to launch one process per GPU:
 .. code-block:: bash
 
     torchrun --nproc_per_node=4 my_training_script.py
+
+For example, four processes with two processes per sample create two DDP
+replicas:
+
+.. code-block:: bash
+
+    torchrun --standalone --nproc_per_node=4 \
+        examples/distributed/demo_hierarchical_training.py --inner-world-size 2
+
+See :ref:`sphx_glr_auto_examples_distributed_demo_hierarchical_training.py` for
+the complete example.
 
 The same script also works in single-process mode:
 

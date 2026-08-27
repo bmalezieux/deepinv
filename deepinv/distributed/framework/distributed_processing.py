@@ -167,13 +167,13 @@ class DistributedProcessing(torch.nn.Module):
         self.local_indices: list[int] = list(self.ctx.local_indices(self.num_patches))
 
         # Check for insufficient work distribution
-        if self.ctx.use_dist and self.ctx.rank == 0:
-            ranks_with_work = min(self.num_patches, self.ctx.world_size)
-            if ranks_with_work < self.ctx.world_size:
+        if self.ctx.use_dist and self.ctx.inner_rank == 0:
+            ranks_with_work = min(self.num_patches, self.ctx.inner_world_size)
+            if ranks_with_work < self.ctx.inner_world_size:
                 warnings.warn(
-                    f"Only {ranks_with_work}/{self.ctx.world_size} ranks have patches to process. "
+                    f"Only {ranks_with_work}/{self.ctx.inner_world_size} ranks have patches to process. "
                     f"Some ranks will have no work. "
-                    f"Current: {self.num_patches} patches for {self.ctx.world_size} ranks.",
+                    f"Current: {self.num_patches} patches for {self.ctx.inner_world_size} ranks.",
                     UserWarning,
                 )
 
