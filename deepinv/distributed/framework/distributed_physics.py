@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
@@ -33,7 +33,10 @@ class DistributedStackedPhysics(Physics):
 
     :param DistributedContext ctx: distributed context manager.
     :param int num_operators: total number of physics operators.
-    :param Callable factory: factory function that creates physics operators. Should have signature `factory(index, device, factory_kwargs) -> Physics`.
+    :param Callable | None factory: factory function that creates physics operators. Should have signature `factory(index, device, factory_kwargs) -> Physics`.
+    :param Sequence[Physics] | None local_physics: operators already owned by this rank when ``from_shard=True``.
+    :param Sequence[int] | None local_indexes: global indices corresponding positionally to ``local_physics``.
+    :param bool from_shard: adopt ``local_physics`` without applying DeepInv's partition. Construction validates ownership collectively within the inner group.
     :param dict | None factory_kwargs: shared data dictionary passed to factory function. Default is `None`.
     :param torch.dtype | None dtype: data type for operations. Default is `None`.
     :param str gather_strategy: strategy for gathering distributed results. Options are:
@@ -48,8 +51,11 @@ class DistributedStackedPhysics(Physics):
         self,
         ctx: DistributedContext,
         num_operators: int,
-        factory: Callable[[int, torch.device, dict | None], Physics],
+        factory: Callable[[int, torch.device, dict | None], Physics] | None = None,
         *,
+        local_physics: Sequence[Physics] | None = None,
+        local_indexes: Sequence[int] | None = None,
+        from_shard: bool = False,
         factory_kwargs: dict | None = None,
         dtype: torch.dtype | None = None,
         gather_strategy: str = "concatenated",
@@ -62,7 +68,7 @@ class DistributedStackedPhysics(Physics):
         self.ctx = ctx
         self.dtype = dtype or torch.float32
         self.num_operators = num_operators
-        self.local_indexes: list[int] = ctx.local_indices(num_operators)
+        self.from_shard = from_shard
 
         # Validate and set gather strategy
         valid_strategies = ("naive", "concatenated", "broadcast")
@@ -72,18 +78,120 @@ class DistributedStackedPhysics(Physics):
             )
         self.gather_strategy = gather_strategy
 
-        # Broadcast shared object (lightweight) once (root=0) if present
-        self.factory_kwargs = factory_kwargs
-        if ctx.use_dist and factory_kwargs is not None:
-            obj = [factory_kwargs if ctx.inner_rank == 0 else None]
-            self.ctx.broadcast_object_list(obj, src=0)
-            self.factory_kwargs = obj[0]
+        if from_shard:
+            self.local_indexes = list(local_indexes or [])
+            self.local_physics = list(local_physics or [])
+            self._validate_shard_ownership()
+            self.local_physics = [p.to(ctx.device) for p in self.local_physics]
+            self.factory_kwargs = None
+        else:
+            if factory is None:
+                raise ValueError("factory is required when from_shard=False.")
+            self.local_indexes = ctx.local_indices(num_operators)
+            self.factory_kwargs = factory_kwargs
+            if ctx.use_dist and factory_kwargs is not None:
+                obj = [factory_kwargs if ctx.inner_rank == 0 else None]
+                self.ctx.broadcast_object_list(obj, src=0)
+                self.factory_kwargs = obj[0]
 
-        # Build local physics
-        self.local_physics: list[Physics] = []
-        for i in self.local_indexes:
-            p_i = factory(i, ctx.device, self.factory_kwargs)
-            self.local_physics.append(p_i)
+            self.local_physics = []
+            for i in self.local_indexes:
+                p_i = factory(i, ctx.device, self.factory_kwargs)
+                self.local_physics.append(p_i)
+
+    def _validate_shard_ownership(self) -> None:
+        """Collectively validate a pre-sharded operator partition."""
+        local_errors = []
+        if (
+            isinstance(self.num_operators, bool)
+            or not isinstance(self.num_operators, int)
+            or self.num_operators < 0
+        ):
+            local_errors.append(
+                f"num_operators must be a non-negative integer, got {self.num_operators!r}"
+            )
+        if len(self.local_physics) != len(self.local_indexes):
+            local_errors.append(
+                "local physics and global_indices must have the same length, got "
+                f"{len(self.local_physics)} and {len(self.local_indexes)}"
+            )
+
+        valid_num_operators = (
+            isinstance(self.num_operators, int)
+            and not isinstance(self.num_operators, bool)
+            and self.num_operators >= 0
+        )
+        seen = set()
+        for index in self.local_indexes:
+            if isinstance(index, bool) or not isinstance(index, int):
+                local_errors.append(f"global index {index!r} is not an integer")
+                continue
+            if valid_num_operators and not 0 <= index < self.num_operators:
+                local_errors.append(
+                    f"global index {index} is outside [0, {self.num_operators})"
+                )
+            if index in seen:
+                local_errors.append(f"global index {index} is duplicated locally")
+            seen.add(index)
+
+        expected_type = (
+            LinearPhysics
+            if isinstance(self, DistributedStackedLinearPhysics)
+            else Physics
+        )
+        for position, physics in enumerate(self.local_physics):
+            if not isinstance(physics, expected_type):
+                local_errors.append(
+                    f"local physics at position {position} must be a "
+                    f"{expected_type.__name__}, got {type(physics).__name__}"
+                )
+
+        payload = {
+            "num_operators": self.num_operators,
+            "indices": list(self.local_indexes),
+            "errors": local_errors,
+        }
+        gathered = [None] * self.ctx.inner_world_size
+        self.ctx.all_gather_object(gathered, payload)
+
+        errors = []
+        for inner_rank, rank_payload in enumerate(gathered):
+            errors.extend(
+                f"inner rank {inner_rank}: {error}" for error in rank_payload["errors"]
+            )
+        counts = [rank_payload["num_operators"] for rank_payload in gathered]
+        if any(count != counts[0] for count in counts[1:]):
+            errors.append(
+                "inner ranks disagree on num_operators: "
+                + ", ".join(
+                    f"rank {rank}={count!r}" for rank, count in enumerate(counts)
+                )
+            )
+
+        if valid_num_operators and not errors:
+            owners: dict[int, list[int]] = {}
+            for inner_rank, rank_payload in enumerate(gathered):
+                for index in rank_payload["indices"]:
+                    owners.setdefault(index, []).append(inner_rank)
+            duplicates = {
+                index: ranks for index, ranks in owners.items() if len(ranks) > 1
+            }
+            missing = sorted(set(range(self.num_operators)) - set(owners))
+            if duplicates:
+                errors.append(
+                    "global indices have multiple owners: "
+                    + ", ".join(
+                        f"{index} on inner ranks {ranks}"
+                        for index, ranks in sorted(duplicates.items())
+                    )
+                )
+            if missing:
+                errors.append(f"missing global indices: {missing}")
+
+        if errors:
+            raise ValueError(
+                "Invalid pre-sharded physics ownership: " + "; ".join(errors)
+            )
 
     # -------- Factorized map-reduce logic --------
     def _map_reduce_gather(
@@ -244,8 +352,11 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
 
     :param DistributedContext ctx: distributed context manager.
     :param int num_operators: total number of physics operators to distribute.
-    :param Callable factory: factory function that creates linear physics operators.
+    :param Callable | None factory: factory function that creates linear physics operators.
         Should have signature `factory(index: int, device: torch.device, factory_kwargs: dict | None) -> LinearPhysics`.
+    :param Sequence[LinearPhysics] | None local_physics: operators already owned by this rank when ``from_shard=True``.
+    :param Sequence[int] | None local_indexes: global indices corresponding positionally to ``local_physics``.
+    :param bool from_shard: adopt ``local_physics`` without repartitioning. Default is ``False``.
     :param dict | None factory_kwargs: shared data dictionary passed to factory function for all operators. Default is `None`.
     :param torch.dtype | None dtype: data type for operations. Default is `None`.
     :param str gather_strategy: strategy for gathering distributed results in forward operations.
@@ -256,8 +367,11 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         self,
         ctx: DistributedContext,
         num_operators: int,
-        factory,
+        factory=None,
         *,
+        local_physics: Sequence[LinearPhysics] | None = None,
+        local_indexes: Sequence[int] | None = None,
+        from_shard: bool = False,
         factory_kwargs: dict | None = None,
         dtype: torch.dtype | None = None,
         gather_strategy: str = "concatenated",
@@ -270,6 +384,9 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
             ctx=ctx,
             num_operators=num_operators,
             factory=factory,
+            local_physics=local_physics,
+            local_indexes=local_indexes,
+            from_shard=from_shard,
             factory_kwargs=factory_kwargs,
             dtype=dtype,
             gather_strategy=gather_strategy,
@@ -281,6 +398,30 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         for p in self.local_physics:
             if not isinstance(p, LinearPhysics):
                 raise ValueError("factory must return LinearPhysics instances.")
+
+    def _select_local_operator_inputs(self, values, name: str):
+        """Select global inputs or validate rank-local inputs in shard mode."""
+        local_count = len(self.local_physics)
+        if values is None:
+            if self.from_shard and local_count == 0:
+                return []
+            raise ValueError(f"Input {name} cannot be None on a nonempty shard.")
+        if self.from_shard:
+            if len(values) != local_count:
+                raise ValueError(
+                    f"Distributed physics constructed with from_shard=True expects "
+                    f"{local_count} local {name} entries aligned with "
+                    f"local_indexes={self.local_indexes}, but received {len(values)}."
+                )
+            return values
+        if len(values) == self.num_operators:
+            return [values[i] for i in self.local_indexes]
+        if len(values) == local_count:
+            return values
+        raise ValueError(
+            f"Input {name} has length {len(values)}, expected {self.num_operators} "
+            f"(global) or {local_count} (local)."
+        )
 
     def A_adjoint(
         self,
@@ -303,15 +444,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         :return: complete adjoint result :math:`A^T y` (or local contribution if gather=False).
         """
 
-        # Extract local measurements
-        if len(y) == self.num_operators:
-            y_local = [y[i] for i in self.local_indexes]
-        elif len(y) == len(self.local_indexes):
-            y_local = y
-        else:
-            raise ValueError(
-                f"Input y has length {len(y)}, expected {self.num_operators} (global) or {len(self.local_indexes)} (local)."
-            )
+        y_local = self._select_local_operator_inputs(y, "y")
 
         # Use _map_reduce_gather with per-operator inputs and sum_results=True
         # This gathers all A_i^T(y_i) and sums them automatically
@@ -345,14 +478,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         :return: complete VJP result (or local contribution if gather=False).
         """
 
-        if len(v) == self.num_operators:
-            v_local = [v[i] for i in self.local_indexes]
-        elif len(v) == len(self.local_indexes):
-            v_local = v
-        else:
-            raise ValueError(
-                f"Input v has length {len(v)}, expected {self.num_operators} (global) or {len(self.local_indexes)} (local)."
-            )
+        v_local = self._select_local_operator_inputs(v, "v")
 
         return self._map_reduce_gather(
             v_local,
@@ -466,16 +592,7 @@ class DistributedStackedLinearPhysics(DistributedStackedPhysics, LinearPhysics):
         """
         if local_only:
             # Efficient local computation with single sum reduction
-            if isinstance(y, TensorList):
-                y_local = [y[i] for i in self.local_indexes]
-            elif len(y) == self.num_operators:
-                y_local = [y[i] for i in self.local_indexes]
-            elif len(y) == len(self.local_indexes):
-                y_local = y
-            else:
-                raise ValueError(
-                    f"Input y has length {len(y)}, expected {self.num_operators} (global) or {len(self.local_indexes)} (local)."
-                )
+            y_local = self._select_local_operator_inputs(y, "y")
 
             return self._map_reduce_gather(
                 y_local,

@@ -2257,7 +2257,7 @@ def test_distributed_data_fidelity_backward(device_config, num_operators):
 def _test_distributed_gradient_sync_higher_order_worker(rank, world_size, args):
     """Test higher-order gradients through DistributedGradientSync."""
     with DistributedContext(device_mode=args["device_mode"], seed=42) as ctx:
-        x = torch.randn(1, 1, 8, 8, device=ctx.device, requires_grad=True)
+        x = torch.randn(1, 1, 32, 32, device=ctx.device, requires_grad=True)
         x_ref = x.detach().clone().requires_grad_(True)
 
         physics_list = create_test_physics_list(ctx.device, 3)
@@ -2944,3 +2944,357 @@ def test_distributed_processor_backward_multiple_calls(device_config):
         _test_processor_backward_multiple_calls_worker, device_config, test_args
     )
     assert all(r == "success" for r in results)
+
+
+# =============================================================================
+# Pre-sharded Physics Tests
+# =============================================================================
+
+
+def _test_sharded_physics_worker(rank, world_size, args):
+    """Exercise arbitrary and empty ownership with local measurements."""
+    with DistributedContext(device_mode="cpu", seed=7, seed_offset=False) as ctx:
+        ownership = args["ownership"]
+        local_indices = ownership[rank]
+        # LinearPhysics instances with distinct scales make global ordering visible.
+        from deepinv.physics import LinearPhysics
+
+        all_physics = [
+            LinearPhysics(
+                A=lambda x, scale=index + 1: scale * x,
+                A_adjoint=lambda y, scale=index + 1: scale * y,
+            ).to(ctx.device)
+            for index in range(args["num_operators"])
+        ]
+        local = [all_physics[i] for i in local_indices]
+        if not local_indices and args.get("none_empty", False):
+            local, provided_indices = None, None
+        else:
+            provided_indices = local_indices
+        if args.get("single", False):
+            local = local[0]
+        elif args.get("stacked", False) and local:
+            local = StackedLinearPhysics(local)
+
+        physics = distribute(
+            local,
+            ctx,
+            type_object="linear_physics",
+            from_shard=True,
+            num_operators=args["num_operators"],
+            global_indices=provided_indices,
+            gather_strategy=args.get("gather_strategy", "concatenated"),
+        )
+        assert physics.from_shard
+        assert physics.local_indexes == local_indices
+        assert len(physics.local_physics) == len(local_indices)
+
+        x = torch.randn(1, 1, 8, 8, device=ctx.device, requires_grad=True)
+        y_local = physics.A(x, gather=False)
+        assert len(y_local) == len(local_indices)
+        y_global = physics.A(x, gather=True)
+        reference = StackedLinearPhysics(all_physics)
+        y_reference = reference.A(x)
+        for actual, expected in zip(y_global, y_reference, strict=True):
+            assert torch.allclose(actual, expected, atol=1e-5)
+
+        adjoint = physics.A_adjoint(y_local if local_indices else None)
+        assert torch.allclose(adjoint, reference.A_adjoint(y_reference), atol=1e-5)
+
+        data_fidelity = distribute(L2(), ctx)
+        zero_local = [torch.zeros_like(value) for value in y_local]
+        value = data_fidelity.fn(x, zero_local if local_indices else None, physics)
+        gradient = data_fidelity.grad(x, zero_local if local_indices else None, physics)
+        zero_global = [torch.zeros_like(value) for value in y_reference]
+        reference_fidelity = StackedPhysicsDataFidelity(
+            [L2() for _ in range(args["num_operators"])]
+        )
+        expected_value = reference_fidelity.fn(x, zero_global, reference)
+        expected_gradient = reference_forward_vjp_grad(
+            x,
+            zero_global,
+            all_physics,
+            reference_fidelity.data_fidelity_list,
+        )
+        assert torch.allclose(value, expected_value, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(gradient, expected_gradient, atol=1e-5, rtol=1e-5)
+
+        value.backward()
+        assert x.grad is not None
+        assert torch.allclose(x.grad, expected_gradient, atol=1e-5, rtol=1e-5)
+        return "success"
+
+
+@pytest.mark.parametrize("gather_strategy", ["concatenated", "broadcast"])
+def test_sharded_physics_arbitrary_ownership(gather_strategy):
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    args = {
+        "num_operators": 4,
+        "ownership": [[2, 0], [3, 1]],
+        "gather_strategy": gather_strategy,
+    }
+    results = run_distributed_test(
+        _test_sharded_physics_worker, config, args, timeout_per_rank=60
+    )
+    assert results == ["success", "success"]
+
+
+def test_sharded_stacked_physics_arbitrary_ownership():
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    args = {
+        "num_operators": 4,
+        "ownership": [[3, 0], [1, 2]],
+        "stacked": True,
+    }
+    results = run_distributed_test(
+        _test_sharded_physics_worker, config, args, timeout_per_rank=60
+    )
+    assert results == ["success", "success"]
+
+
+@pytest.mark.parametrize("empty_rank", [0, 1])
+@pytest.mark.parametrize("none_empty", [False, True])
+def test_sharded_physics_maximally_imbalanced(empty_rank, none_empty):
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    ownership = [[], [0, 1, 2]] if empty_rank == 0 else [[0, 1, 2], []]
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    args = {
+        "num_operators": 3,
+        "ownership": ownership,
+        "none_empty": none_empty,
+    }
+    results = run_distributed_test(
+        _test_sharded_physics_worker, config, args, timeout_per_rank=60
+    )
+    assert results == ["success", "success"]
+
+
+def test_sharded_single_physics_per_rank():
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    args = {"num_operators": 2, "ownership": [[1], [0]], "single": True}
+    results = run_distributed_test(
+        _test_sharded_physics_worker, config, args, timeout_per_rank=60
+    )
+    assert results == ["success", "success"]
+
+
+@pytest.mark.parametrize(
+    "local,indices,num_operators,error",
+    [
+        (None, [], 0, "both be None"),
+        ([], None, 0, "both be None"),
+        ([], [], None, "num_operators is required"),
+        ([], [0], 1, "same length"),
+        (None, None, 1, "missing global indices"),
+        ([], [True], 1, "not an integer"),
+    ],
+)
+def test_sharded_physics_invalid_local_inputs(local, indices, num_operators, error):
+    with DistributedContext(device_mode="cpu") as ctx:
+        with pytest.raises((ValueError, TypeError), match=error):
+            distribute(
+                local,
+                ctx,
+                type_object="linear_physics",
+                from_shard=True,
+                num_operators=num_operators,
+                global_indices=indices,
+            )
+
+
+def test_sharded_physics_invalid_indices():
+    from deepinv.physics import LinearPhysics
+
+    cases = [
+        ([LinearPhysics()], [-1], "outside"),
+        ([LinearPhysics()], [1], "outside"),
+        ([LinearPhysics(), LinearPhysics()], [0, 0], "duplicated locally"),
+        ([LinearPhysics()], [0.5], "not an integer"),
+    ]
+    with DistributedContext(device_mode="cpu") as ctx:
+        for local, indices, error in cases:
+            with pytest.raises(ValueError, match=error):
+                distribute(
+                    local,
+                    ctx,
+                    type_object="linear_physics",
+                    from_shard=True,
+                    num_operators=1,
+                    global_indices=indices,
+                )
+
+
+def test_sharded_physics_factory_and_measurement_errors():
+    with DistributedContext(device_mode="cpu") as ctx:
+        with pytest.raises(ValueError, match="factories cannot"):
+            distribute(
+                lambda *_: None,
+                ctx,
+                type_object="linear_physics",
+                from_shard=True,
+                num_operators=1,
+                global_indices=[0],
+            )
+        physics_list = create_test_physics_list(ctx.device, 2)
+        physics = distribute(
+            physics_list,
+            ctx,
+            from_shard=True,
+            num_operators=2,
+            global_indices=[0, 1],
+        )
+        data_fidelity = distribute(L2(), ctx)
+        x = torch.randn(1, 1, 8, 8)
+        with pytest.raises(ValueError, match="Pass only this rank's measurement shard"):
+            data_fidelity.fn(x, [x, x, x], physics)
+        with pytest.raises(NotImplementedError, match="from_shard=True"):
+            data_fidelity.prox(x, [x, x], physics)
+
+
+def test_sharded_physics_more_ranks_than_operators():
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 3, "skip_reason": None}
+    args = {
+        "num_operators": 1,
+        "ownership": [[], [0], []],
+        "none_empty": True,
+    }
+    results = run_distributed_test(
+        _test_sharded_physics_worker, config, args, timeout_per_rank=60
+    )
+    assert results == ["success", "success", "success"]
+
+
+def _test_sharded_invalid_ownership_worker(rank, world_size, args):
+    with DistributedContext(device_mode="cpu") as ctx:
+        if args["case"] == "missing":
+            indices, count = ([0] if rank == 0 else []), 2
+        elif args["case"] == "duplicate":
+            indices, count = [0], 1
+        else:
+            indices, count = ([0] if rank == 0 else [1]), rank + 1
+        from deepinv.physics import LinearPhysics
+
+        local = [LinearPhysics() for _ in indices]
+        with pytest.raises(ValueError, match=args["error"]):
+            distribute(
+                local,
+                ctx,
+                type_object="linear_physics",
+                from_shard=True,
+                num_operators=count,
+                global_indices=indices,
+            )
+        return "success"
+
+
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("missing", "missing global indices"),
+        ("duplicate", "multiple owners"),
+        ("counts", "disagree on num_operators"),
+    ],
+)
+def test_sharded_physics_invalid_cross_rank_ownership(case, error):
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    results = run_distributed_test(
+        _test_sharded_invalid_ownership_worker,
+        config,
+        {"case": case, "error": error},
+    )
+    assert results == ["success", "success"]
+
+
+def _test_sharded_inner_group_validation_worker(rank, world_size, args):
+    with DistributedContext(device_mode="cpu", inner_world_size=2) as ctx:
+        from deepinv.physics import LinearPhysics
+
+        # Each data-parallel replica owns a complete partition independently.
+        local_index = 1 - ctx.inner_rank
+        physics = distribute(
+            LinearPhysics(),
+            ctx,
+            type_object="linear_physics",
+            from_shard=True,
+            num_operators=2,
+            global_indices=[local_index],
+        )
+        assert physics.local_indexes == [local_index]
+        return "success"
+
+
+def test_sharded_validation_is_scoped_to_inner_group():
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
+    results = run_distributed_test(
+        _test_sharded_inner_group_validation_worker,
+        config,
+        timeout_per_rank=60,
+    )
+    assert results == ["success"] * 4
+
+
+def _test_sharded_heterogeneous_measurements_worker(rank, world_size, args):
+    with DistributedContext(device_mode="cpu", seed=3, seed_offset=False) as ctx:
+        from deepinv.physics import LinearPhysics
+        import torch.nn.functional as F
+
+        widths = [2, 5, 3]
+        ownership = [[2, 0], [1]]
+        indices = ownership[rank]
+        all_physics = [
+            LinearPhysics(
+                A=lambda x, width=width: x[..., :width],
+                A_adjoint=lambda y, width=width: F.pad(y, (0, 8 - width)),
+            )
+            for width in widths
+        ]
+        physics = distribute(
+            [all_physics[index] for index in indices],
+            ctx,
+            type_object="linear_physics",
+            from_shard=True,
+            num_operators=len(widths),
+            global_indices=indices,
+        )
+        x = torch.randn(1, 1, 4, 8, requires_grad=True)
+        local_y = physics.A(x, gather=False)
+        gathered_y = physics.A(x, gather=True)
+        assert [value.shape[-1] for value in gathered_y] == widths
+        expected_adjoint = sum(
+            operator.A_adjoint(value)
+            for operator, value in zip(all_physics, gathered_y, strict=True)
+        )
+        assert torch.allclose(physics.A_adjoint(local_y), expected_adjoint)
+
+        fidelity = distribute(L2(), ctx)
+        zero_local = [torch.zeros_like(value) for value in local_y]
+        gradient = fidelity.grad(x, zero_local, physics)
+        assert torch.allclose(gradient, expected_adjoint)
+        gradient.sum().backward()
+        assert x.grad is not None
+        return "success"
+
+
+def test_sharded_physics_heterogeneous_measurement_shapes():
+    if platform.system() == "Windows":
+        pytest.skip("Gloo multiprocess tests are not supported on Windows")
+    config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
+    results = run_distributed_test(
+        _test_sharded_heterogeneous_measurements_worker,
+        config,
+        timeout_per_rank=60,
+    )
+    assert results == ["success", "success"]

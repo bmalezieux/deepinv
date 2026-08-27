@@ -209,34 +209,28 @@ def reduce_local_results(
     else:
         local_val = torch.stack(local_results, dim=0).sum(dim=0)
 
-    # 2. Shape synchronization (Broadcast from Rank 0)
-    # Required for all_reduce to work if ranks have different Shapes (e.g. rank 0 has results, rank 1 has none)
+    # 2. Shape synchronization. The source is the first rank with a result; inner
+    # rank zero may legitimately own an empty shard.
     if ctx.use_dist and reduce_op is not None:
-        if ctx.inner_rank == 0:
-            ndim = torch.tensor([local_val.ndim], device=ctx.device, dtype=torch.long)
-        else:
-            ndim = torch.zeros(1, device=ctx.device, dtype=torch.long)
-        ctx.broadcast(ndim, src=0)
-
-        D = ndim.item()
-
-        if D > 0:  # Only if rank 0 result is not a scalar
-            if ctx.inner_rank == 0:
-                shape = torch.tensor(
-                    local_val.shape, device=ctx.device, dtype=torch.long
+        local_metadata = (
+            (tuple(local_val.shape), local_val.dtype) if local_results else None
+        )
+        gathered_metadata = [None] * ctx.inner_world_size
+        ctx.all_gather_object(gathered_metadata, local_metadata)
+        nonempty_metadata = [metadata for metadata in gathered_metadata if metadata]
+        if nonempty_metadata:
+            target_shape, target_dtype = nonempty_metadata[0]
+            if any(
+                metadata != nonempty_metadata[0] for metadata in nonempty_metadata[1:]
+            ):
+                raise ValueError(
+                    "Cannot reduce local results with different shapes or dtypes: "
+                    f"{nonempty_metadata}"
                 )
-            else:
-                shape = torch.zeros(D, device=ctx.device, dtype=torch.long)
-            ctx.broadcast(shape, src=0)
-
-            target_shape = tuple(shape.tolist())
-
-            # Resize local zero-scalar if needed to match target shape
-            if local_val.ndim == 0 and local_val.numel() == 1 and local_val.item() == 0:
-                if local_val.shape != target_shape:
-                    local_val = torch.zeros(
-                        target_shape, device=ctx.device, dtype=local_val.dtype
-                    )
+            if not local_results:
+                local_val = torch.zeros(
+                    target_shape, device=ctx.device, dtype=target_dtype
+                )
     local_val = _ensure_functional_collective_input(ctx, local_val, local_results)
 
     if not reduce_globally:
@@ -669,7 +663,11 @@ def gather_tensorlist_broadcast(
 
     for idx in range(num_operators):
         shape, dtype = shape_map[idx]
-        responsible_rank = idx % ctx.inner_world_size  # Round-robin sharding
+        responsible_rank = next(
+            rank
+            for rank, rank_metadata in enumerate(gathered_metadata)
+            if any(metadata[0] == idx for metadata in rank_metadata)
+        )
 
         # Prepare tensor to send/receive
         if idx in local_indices:

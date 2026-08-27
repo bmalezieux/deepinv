@@ -103,6 +103,39 @@ class DistributedDataFidelity(torch.nn.Module):
                 "physics must be a DistributedStackedLinearPhysics instance to be used with DistributedDataFidelity."
             )
 
+    def _select_local_measurements(
+        self,
+        y: list[torch.Tensor] | None,
+        physics: DistributedStackedLinearPhysics,
+    ) -> list[torch.Tensor]:
+        """Validate the measurement layout and return this rank's measurements."""
+        local_count = len(physics.local_physics)
+        if physics.from_shard:
+            if y is None:
+                if local_count == 0:
+                    return []
+                raise ValueError(
+                    "Distributed physics constructed with from_shard=True expects "
+                    f"{local_count} local measurements aligned with "
+                    f"local_indexes={physics.local_indexes}, but received None."
+                )
+            if len(y) != local_count:
+                raise ValueError(
+                    "Distributed physics constructed with from_shard=True expects "
+                    f"{local_count} local measurements aligned with "
+                    f"local_indexes={physics.local_indexes}, but received {len(y)}. "
+                    "Pass only this rank's measurement shard in the same order."
+                )
+            return list(y)
+
+        if y is None or len(y) != physics.num_operators:
+            received = "None" if y is None else len(y)
+            raise ValueError(
+                f"Input y has length {received}, expected {physics.num_operators} "
+                "(global measurements)."
+            )
+        return [y[i] for i in physics.local_indexes]
+
     def _apply_op(
         self,
         local_op: Callable,
@@ -139,12 +172,7 @@ class DistributedDataFidelity(torch.nn.Module):
             **kwargs,
         )
 
-        if len(y) != physics.num_operators:
-            raise ValueError(
-                f"Input y has length {len(y)}, expected {physics.num_operators} "
-                "(global measurements)."
-            )
-        y_local = [y[i] for i in physics.local_indexes]
+        y_local = self._select_local_measurements(y, physics)
 
         # Zip Ax and y for mapping
         if len(Ax_local) != len(y_local):
@@ -287,6 +315,11 @@ class DistributedDataFidelity(torch.nn.Module):
         to the wrapped DataFidelity with the distributed physics object.
         """
         self._check_is_distributed_physics(physics)
+        if physics.from_shard:
+            raise NotImplementedError(
+                "DistributedDataFidelity.prox is not supported with "
+                "from_shard=True; use fn() or grad() with local measurements."
+            )
         if self.single_fidelity is None:
             raise NotImplementedError(
                 "prox is only supported when DistributedDataFidelity wraps a single shared DataFidelity instance."

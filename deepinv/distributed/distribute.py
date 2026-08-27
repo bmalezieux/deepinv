@@ -24,46 +24,92 @@ from deepinv.distributed.strategies import DistributedSignalStrategy
 
 
 def _distribute_physics(
-    physics: (
-        StackedPhysics
-        | list[Physics]
-        | Callable[[int, torch.device, dict | None], Physics]
-    ),
+    physics: StackedPhysics | Physics | Sequence[Physics] | Callable | None,
     ctx: DistributedContext,
     *,
     num_operators: int | None = None,
     type_object: str | None = "physics",
     dtype: torch.dtype | None = torch.float32,
     gather_strategy: str = "concatenated",
+    from_shard: bool = False,
+    global_indices: Sequence[int] | None = None,
     **kwargs,
 ) -> DistributedStackedPhysics | DistributedStackedLinearPhysics:
-    r"""
-    Distribute a Physics object across multiple devices.
+    r"""Distribute a full physics stack or adopt a pre-sharded local stack.
 
-    :param StackedPhysics | list[Physics] | Callable physics: Physics object to distribute.
-        Can be a StackedPhysics, list of Physics objects, or a factory function.
+    With ``from_shard=False`` (default), DeepInv assigns operators using
+    :meth:`DistributedContext.local_indices`. With ``from_shard=True``, ``physics``
+    contains only this rank's operators and ``global_indices`` gives their global
+    positions. Sharded construction is collective within ``ctx.inner_group``.
+
+    :param physics: Full physics collection/factory, or the current rank's local
+        physics in sharded mode. A local stack is flattened and a single
+        :class:`~deepinv.physics.Physics` becomes a one-element shard. Use ``None``
+        for an empty shard.
     :param DistributedContext ctx: distributed context manager.
-    :param int | None num_operators: number of physics operators when using a factory for physics, otherwise inferred. Default is `None`.
-    :param str | None type_object: type of physics object to distribute. Options are `'physics'` or `'linear_physics'`. Default is `'physics'`.
-    :param torch.dtype | None dtype: data type for distributed object. Default is `torch.float32`.
-    :param str gather_strategy: strategy for gathering distributed results. Options are:
-        - `'naive'`: Simple object serialization (best for small tensors)
-        - `'concatenated'`: Single concatenated tensor (best for medium/large tensors, minimal communication)
-        - `'broadcast'`: Per-operator broadcasts (best for heterogeneous sizes or streaming)
-        Default is `'concatenated'`.
-    :param kwargs: additional keyword arguments for DistributedStackedPhysics.
-
-    :return: Distributed version of the input Physics object.
+    :param int | None num_operators: global number of operators. Required in
+        sharded mode and for factories.
+    :param str | None type_object: ``"physics"`` or ``"linear_physics"``.
+    :param torch.dtype | None dtype: fallback dtype for empty reductions.
+    :param str gather_strategy: ``"naive"``, ``"concatenated"``, or ``"broadcast"``.
+    :param bool from_shard: adopt an already-built local shard. Default is ``False``.
+    :param global_indices: global index corresponding to each local operator.
+    :return: distributed physics wrapper.
     """
-    # Physics factory
-    if isinstance(physics, (StackedPhysics, StackedLinearPhysics)):
-        # Extract physics_list from StackedPhysics
+    wrapper = (
+        DistributedStackedLinearPhysics
+        if type_object == "linear_physics"
+        else DistributedStackedPhysics
+    )
+
+    if from_shard:
+        if callable(physics) and not isinstance(physics, Physics):
+            raise ValueError(
+                "Callable physics factories cannot be used with from_shard=True; "
+                "pass the prebuilt local physics shard instead."
+            )
+        if num_operators is None:
+            raise ValueError("num_operators is required when from_shard=True.")
+        if (physics is None) != (global_indices is None):
+            raise ValueError(
+                "physics and global_indices must either both be None for an empty "
+                "shard or both be provided when from_shard=True."
+            )
+        if physics is None:
+            local_physics = []
+            local_indexes = []
+        else:
+            if isinstance(physics, StackedPhysics):
+                local_physics = list(physics.physics_list)
+            elif isinstance(physics, Physics):
+                local_physics = [physics]
+            elif isinstance(physics, (list, tuple)):
+                local_physics = list(physics)
+            else:
+                raise TypeError(
+                    "from_shard=True expects a Physics, StackedPhysics, list/tuple "
+                    f"of Physics, or None; got {type(physics).__name__}."
+                )
+            local_indexes = list(global_indices)
+
+        return wrapper(
+            ctx,
+            num_operators=num_operators,
+            local_physics=local_physics,
+            local_indexes=local_indexes,
+            from_shard=True,
+            dtype=dtype,
+            gather_strategy=gather_strategy,
+            **kwargs,
+        )
+
+    if global_indices is not None:
+        raise ValueError("global_indices is only valid when from_shard=True.")
+    if isinstance(physics, StackedPhysics):
         physics_list_extracted = physics.physics_list
         num_operators = len(physics_list_extracted)
 
-        def physics_factory(
-            idx: int, device: torch.device, factory_kwargs: dict | None
-        ):
+        def physics_factory(idx, device, factory_kwargs):
             return physics_list_extracted[idx].to(device)
 
     elif callable(physics):
@@ -76,29 +122,17 @@ def _distribute_physics(
         physics_list_extracted = physics
         num_operators = len(physics_list_extracted)
 
-        def physics_factory(
-            idx: int, device: torch.device, factory_kwargs: dict | None
-        ):
+        def physics_factory(idx, device, factory_kwargs):
             return physics_list_extracted[idx].to(device)
 
-    if type_object == "linear_physics":
-        return DistributedStackedLinearPhysics(
-            ctx,
-            num_operators=num_operators,
-            factory=physics_factory,
-            dtype=dtype,
-            gather_strategy=gather_strategy,
-            **kwargs,
-        )
-    else:
-        return DistributedStackedPhysics(
-            ctx,
-            num_operators=num_operators,
-            factory=physics_factory,
-            dtype=dtype,
-            gather_strategy=gather_strategy,
-            **kwargs,
-        )
+    return wrapper(
+        ctx,
+        num_operators=num_operators,
+        factory=physics_factory,
+        dtype=dtype,
+        gather_strategy=gather_strategy,
+        **kwargs,
+    )
 
 
 def _distribute_processor(
@@ -385,7 +419,10 @@ def _distribute_base_optim(
 def distribute(
     object: (
         StackedPhysics
+        | Physics
         | list[Physics]
+        | tuple[Physics, ...]
+        | None
         | Callable[[int, torch.device, dict | None], Physics]
         | Denoiser
         | Callable[[int, torch.device, dict | None], Denoiser]
@@ -403,6 +440,8 @@ def distribute(
     type_object: str | None = "auto",
     dtype: torch.dtype | None = torch.float32,
     gather_strategy: str = "concatenated",
+    from_shard: bool = False,
+    global_indices: Sequence[int] | None = None,
     tiling_strategy: DistributedSignalStrategy | None = None,
     tiling_dims: int | tuple[int, ...] | None = None,
     patch_size: int = 256,
@@ -444,6 +483,10 @@ def distribute(
         Generic ``torch.nn.Module`` instances are intentionally not supported by this
         API, to avoid ambiguous partial auto-distribution.
     :param torch.dtype | None dtype: data type for distributed object. Default is `torch.float32`.
+    :param bool from_shard: if ``True``, adopt a rank-local physics shard instead
+        of constructing DeepInv's round-robin partition. Default is ``False``.
+    :param Sequence[int] | None global_indices: global operator indices for the
+        rank-local physics, required for nonempty shards.
     :param str gather_strategy: strategy for gathering distributed results.
 
         Options are:
@@ -531,6 +574,23 @@ def distribute(
         ...     distribute(model, ctx, patch_size=64, overlap=8)
     """
     # Check object type and distribute accordingly
+    if from_shard and type_object == "auto":
+        if object is None or (isinstance(object, (list, tuple)) and not object):
+            raise ValueError(
+                "Empty shards require type_object='physics' or "
+                "type_object='linear_physics'."
+            )
+        candidate = (
+            object.physics_list[0]
+            if isinstance(object, StackedPhysics)
+            else (object[0] if isinstance(object, (list, tuple)) else object)
+        )
+        if not isinstance(candidate, Physics):
+            raise ValueError(f"Cannot auto-detect physics type for {type(candidate)}")
+        type_object = (
+            "linear_physics" if isinstance(candidate, LinearPhysics) else "physics"
+        )
+
     if type_object == "auto":
         if isinstance(object, (StackedPhysics, StackedLinearPhysics)) or (
             isinstance(object, list)
@@ -584,7 +644,13 @@ def distribute(
             num_operators=num_operators,
             type_object=type_object,
             gather_strategy=gather_strategy,
+            from_shard=from_shard,
+            global_indices=global_indices,
             **kwargs,
+        )
+    elif from_shard or global_indices is not None:
+        raise ValueError(
+            "from_shard and global_indices are only supported for physics objects."
         )
     elif type_object == "denoiser":
         return _distribute_processor(
